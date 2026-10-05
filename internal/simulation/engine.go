@@ -9,7 +9,7 @@ import (
 type Engine struct {
 	rng            *rand.Rand
 	horde          []Zombie
-	survivors      []*Survivor
+	survivors      []Survivor
 	obstacles      []Obstacle
 	exits          []ExitZone
 	escaped        int
@@ -75,7 +75,7 @@ func NewEngine(seed int64) *Engine {
 		e.obstacles = append(e.obstacles, Obstacle{X: ox, Y: oy, W: w, H: h})
 	}
 
-	e.survivors = make([]*Survivor, TotalSurvivors)
+	e.survivors = make([]Survivor, TotalSurvivors)
 
 	for i := 0; i < TotalSurvivors; i++ {
 		var x, y float64
@@ -98,7 +98,7 @@ func NewEngine(seed int64) *Engine {
 			}
 		}
 
-		e.survivors[i] = &Survivor{
+		e.survivors[i] = Survivor{
 			Alive:         true,
 			Escaped:       false,
 			ID:            int64(i),
@@ -316,23 +316,25 @@ func (e *Engine) Update() {
 				}
 			} else {
 				bestSurvDist := math.MaxFloat64
-				var targetLeader *Survivor
+				leaderIdx := -1
 
 				for j := 0; j < len(e.survivors); j++ {
-					if e.survivors[j].Alive && !e.survivors[j].Escaped && e.survivors[j].IsSurvivalist {
-						sdx := e.survivors[j].X - e.survivors[i].X
-						sdy := e.survivors[j].Y - e.survivors[i].Y
+					other := &e.survivors[j]
+					if other.Alive && !other.Escaped && other.IsSurvivalist {
+						sdx := other.X - e.survivors[i].X
+						sdy := other.Y - e.survivors[i].Y
 						d := math.Sqrt(sdx*sdx + sdy*sdy)
 						if d < bestSurvDist {
 							bestSurvDist = d
-							targetLeader = e.survivors[j]
+							leaderIdx = j
 						}
 					}
 				}
 
-				if targetLeader != nil && bestSurvDist < 1800.0 {
-					dx = ((targetLeader.X - e.survivors[i].X) / bestSurvDist) * e.survivors[i].Speed * e.survivors[i].Fear
-					dy = ((targetLeader.Y - e.survivors[i].Y) / bestSurvDist) * e.survivors[i].Speed * e.survivors[i].Fear
+				if leaderIdx >= 0 && bestSurvDist < 1800.0 {
+					leader := &e.survivors[leaderIdx]
+					dx = ((leader.X - e.survivors[i].X) / bestSurvDist) * e.survivors[i].Speed * e.survivors[i].Fear
+					dy = ((leader.Y - e.survivors[i].Y) / bestSurvDist) * e.survivors[i].Speed * e.survivors[i].Fear
 				} else {
 					e.survivors[i].WanderAng += (e.rng.Float64() - 0.5) * 0.5
 					dx = math.Cos(e.survivors[i].WanderAng) * e.survivors[i].Speed * 0.8
@@ -378,10 +380,11 @@ func (e *Engine) Update() {
 		inRoom := (z.X >= e.centerRoomX && z.X <= e.centerRoomX+e.centerRoomSize && z.Y >= e.centerRoomY && z.Y <= e.centerRoomY+e.centerRoomSize)
 
 		closestDist := math.MaxFloat64
-		var target *Survivor
+		closestIdx := -1
 
 		for j := 0; j < len(e.survivors); j++ {
-			if !e.survivors[j].Alive || e.survivors[j].Escaped {
+			s := &e.survivors[j]
+			if !s.Alive || s.Escaped {
 				continue
 			}
 
@@ -390,20 +393,21 @@ func (e *Engine) Update() {
 				continue
 			}
 
-			dx := e.survivors[j].X - z.X
-			dy := e.survivors[j].Y - z.Y
+			dx := s.X - z.X
+			dy := s.Y - z.Y
 			dist := math.Sqrt(dx*dx + dy*dy)
 
 			if dist < closestDist {
 				closestDist = dist
-				target = e.survivors[j]
+				closestIdx = j
 			}
 		}
 
 		dx, dy := 0.0, 0.0
 
 		// Cas 1 : Cible humaine directe et visible
-		if target != nil && closestDist < ZombieVisionRadius {
+		if closestIdx >= 0 && closestDist < ZombieVisionRadius {
+			target := &e.survivors[closestIdx]
 			dx = ((target.X - z.X) / closestDist) * z.Speed
 			dy = ((target.Y - z.Y) / closestDist) * z.Speed
 
