@@ -6,6 +6,13 @@ import (
 	"github.com/Chroq/zombie-horde/internal/simulation"
 )
 
+func BenchmarkNewEngine(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		simulation.NewEngine(simulation.MasterSeed)
+	}
+}
+
 func BenchmarkUpdateSimulation(b *testing.B) {
 	b.ReportAllocs()
 	engine := simulation.NewEngine(simulation.MasterSeed)
