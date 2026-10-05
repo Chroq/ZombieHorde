@@ -148,7 +148,7 @@ func collidesWithObstacleOrClosedExit(x, y float64) bool {
 	return false
 }
 
-func initSimulation(seed int64) {
+func InitSimulation(seed int64) {
 	simRng = rand.New(rand.NewSource(seed))
 	escaped = 0
 
@@ -238,7 +238,7 @@ func initSimulation(seed int64) {
 	}
 
 	horde = make([]Zombie, InitialInfected)
-	for k := 0; k < InitialInfected; k++ {
+	for k := range InitialInfected {
 		survivors[k].Alive = false
 		horde[k] = Zombie{
 			Active:    true,
@@ -251,7 +251,7 @@ func initSimulation(seed int64) {
 	}
 }
 
-func updateSimulation() {
+func UpdateSimulation() {
 	var sumX, sumY float64
 	var aliveCount float64
 	var aliveInRoomCount float64
@@ -628,7 +628,7 @@ func getOpenExitsCount() int {
 func wsHandler(ws *websocket.Conn) {
 	defer ws.Close()
 
-	initSimulation(MasterSeed)
+	InitSimulation(MasterSeed)
 
 	ticker := time.NewTicker(time.Second / time.Duration(TargetFPS))
 	defer ticker.Stop()
@@ -638,7 +638,7 @@ func wsHandler(ws *websocket.Conn) {
 	currentTPS := 0
 
 	for range ticker.C {
-		updateSimulation()
+		UpdateSimulation()
 
 		frames++
 		if time.Since(lastCheck) >= time.Second {
