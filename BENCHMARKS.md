@@ -73,3 +73,35 @@
 1. **Perte de localité spatiale (Cache Misses L1/L2) :** `[]Survivor` garantissait un alignement contigu en RAM, permettant au Hardware Prefetcher du CPU d'anticiper le chargement par lignes de cache de 64 octets. La tranche de pointeurs `[]*Survivor` force un déréférencement systématique (pointer chasing) vers des adresses dispersées sur le tas.
 2. **Pression accrue sur le Garbage Collector :** Le graphe d'objets contient 10 000 pointeurs individuels supplémentaires à scanner lors des phases de marquage du runtime Go, augmentant également le volume d'allocation par tick.
 
+---
+
+### Mesure d'Initialisation : `BenchmarkNewEngine` (avec `[]*Survivor`)
+
+- **Date :** 05/10/2026
+- **Description :** Mesure du coût CPU, du volume mémoire et du nombre d'allocations lors de l'instanciation complète du moteur (`NewEngine(MasterSeed)` avec 10 000 agents sous forme de `[]*Survivor`).
+- **Commande :**
+  ```bash
+  go test -bench=BenchmarkNewEngine -benchmem -benchtime=3s -count=3 ./internal/simulation
+  ```
+- **Sortie brute du benchmark :**
+  ```text
+  goos: linux
+  goarch: amd64
+  pkg: github.com/Chroq/zombie-horde/internal/simulation
+  cpu: Intel(R) Core(TM) i7-8665U CPU @ 1.90GHz
+  BenchmarkNewEngine-8   	    3032	   1229575 ns/op	  730808 B/op	   10010 allocs/op
+  BenchmarkNewEngine-8   	    2968	   1242751 ns/op	  730801 B/op	   10010 allocs/op
+  BenchmarkNewEngine-8   	    2901	   1297605 ns/op	  730801 B/op	   10010 allocs/op
+  PASS
+  ok  	github.com/Chroq/zombie-horde/internal/simulation	15.716s
+  ```
+
+#### Synthèse :
+- **Temps moyen par initialisation :** `~1.26 ms` (min: `1.23 ms`, max: `1.30 ms`)
+- **Volume d'allocations mémoire :** `~730.8 KB/op` (730 803 octets par appel)
+- **Nombre d'allocations mémoire :** `10 010 allocs/op`
+
+#### Constat matériel & mémoire :
+L'utilisation de la tranche de pointeurs `[]*Survivor` force **10 000 allocations individuelles sur le tas** (une pour chaque `&Survivor{}`), en plus des slices internes (`horde`, `obstacles`, etc.). Ce test chiffre précisément l'explosion des allocations à la création du moteur, confirmant la dispersion des adresses mémoire sur le heap dès l'initialisation.
+
+
