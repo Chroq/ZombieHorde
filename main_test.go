@@ -3,17 +3,17 @@ package main_test
 import (
 	"testing"
 
-	main "github.com/Chroq/zombie-horde"
+	"github.com/Chroq/zombie-horde/internal/simulation"
 )
 
 // BenchmarkUpdateSimulation mesure le coût d'exécution d'un tick unitaire (UpdateSimulation).
 // b.ReportAllocs() garantit que les métriques d'allocation (B/op et allocs/op) sont systématiquement tracées.
 func BenchmarkUpdateSimulation(b *testing.B) {
 	b.ReportAllocs()
-	main.InitSimulation(main.MasterSeed)
+	simulation.InitSimulation(simulation.MasterSeed)
 
 	for b.Loop() {
-		main.UpdateSimulation()
+		simulation.UpdateSimulation()
 	}
 }
 
@@ -25,18 +25,18 @@ func BenchmarkSimulation50Ticks(b *testing.B) {
 
 	for b.Loop() {
 		b.StopTimer()
-		main.InitSimulation(main.MasterSeed)
+		simulation.InitSimulation(simulation.MasterSeed)
 		b.StartTimer()
 
 		for range 50 {
-			main.UpdateSimulation()
+			simulation.UpdateSimulation()
 		}
 	}
 }
 
 func TestSimulationDeterministicRun(t *testing.T) {
-	main.InitSimulation(main.MasterSeed)
+	simulation.InitSimulation(simulation.MasterSeed)
 	for range 10 {
-		main.UpdateSimulation()
+		simulation.UpdateSimulation()
 	}
 }

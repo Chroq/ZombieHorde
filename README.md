@@ -28,23 +28,38 @@ Moteur de simulation spatiale en temps réel modélisant la propagation d'une in
 
 ## 2. Structure du Projet
 
-````text
+```text
 .
-├── index.html    # Interface web autonome (Canvas 2D, télémétrie, dashboard)
-├── go.mod        # Déclaration du module Go
-├── go.sum        # Sommes de contrôle des dépendances
-└── main.go       # Moteur de simulation, boucle logique et serveur WebSocket
+├── cmd/
+│   └── server/          # Point d'entrée de l'application serveur
+│       └── main.go
+├── internal/
+│   ├── server/          # Serveur HTTP et WebSocket de télémétrie
+│   │   └── server.go
+│   └── simulation/      # Moteur de simulation spatiale et règles métier
+│       ├── constants.go
+│       ├── engine.go
+│       ├── simulation_test.go
+│       └── types.go
+├── index.html           # Interface web autonome (Canvas 2D, télémétrie, dashboard)
+├── go.mod               # Déclaration du module Go
+├── go.sum               # Sommes de contrôle des dépendances
+├── main.go              # Point d'entrée racine (raccourci)
+└── main_test.go         # Benchmarks et tests de performance racine
+```
 
 ## 3. Prérequis
 
-  Go : version 1.20 ou supérieure.Un navigateur web moderne compatible WebSocket et Canvas HTML5 (Chrome, Firefox, Safari, Edge).
+- Go : version 1.20 ou supérieure.
+- Un navigateur web moderne compatible WebSocket et Canvas HTML5 (Chrome, Firefox, Safari, Edge).
 
-## 4. Installation & LancementInitialiser le module et télécharger les dépendances :Bashgo mod init zombie-engine
+## 4. Installation & Lancement
+
+Télécharger les dépendances :
 
 ```bash
-go get golang.org/x/net/websocket
 go mod tidy
-````
+```
 
 Démarrer le serveur de simulation :
 
