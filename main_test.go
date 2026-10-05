@@ -36,7 +36,7 @@ func BenchmarkSimulation50Ticks(b *testing.B) {
 
 func TestSimulationDeterministicRun(t *testing.T) {
 	main.InitSimulation(main.MasterSeed)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		main.UpdateSimulation()
 	}
 }
