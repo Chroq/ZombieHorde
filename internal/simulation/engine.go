@@ -7,6 +7,13 @@ import (
 
 // Engine encapsule l'état complet et le moteur de calcul d'une simulation ZombieHorde.
 type Engine struct {
+	// Grille spatiale 1D contiguë (Spatial Hashing par linked-cells sans pointeurs)
+	grid         [GridCols * GridRows]Cell
+	survivorNext [TotalSurvivors]int32
+	zombieNext   [TotalSurvivors]int32
+	wasAlerted   [TotalSurvivors]bool
+	newZombies   []Zombie
+
 	rng            *rand.Rand
 	horde          []Zombie
 	survivors      []Survivor
@@ -25,8 +32,9 @@ type Engine struct {
 // NewEngine instancie et initialise une nouvelle simulation déterministe à partir d'une graine.
 func NewEngine(seed int64) *Engine {
 	e := &Engine{
-		rng:     rand.New(rand.NewSource(seed)),
-		escaped: 0,
+		rng:        rand.New(rand.NewSource(seed)),
+		escaped:    0,
+		newZombies: make([]Zombie, 0, 128),
 	}
 
 	e.exits = []ExitZone{
@@ -59,7 +67,7 @@ func NewEngine(seed int64) *Engine {
 		{X: e.centerRoomX + e.centerRoomSize - 30, Y: e.centerRoomY, W: 30, H: e.centerRoomSize},
 	}
 
-	for i := 0; i < ObstacleCount; i++ {
+	for range ObstacleCount {
 		w := 150.0 + e.rng.Float64()*350.0
 		h := 80.0 + e.rng.Float64()*300.0
 		if e.rng.Float64() > 0.5 {
@@ -77,7 +85,7 @@ func NewEngine(seed int64) *Engine {
 
 	e.survivors = make([]Survivor, TotalSurvivors)
 
-	for i := 0; i < TotalSurvivors; i++ {
+	for i := range TotalSurvivors {
 		var x, y float64
 		if i < CenterRoomSurvivors {
 			for {
@@ -151,22 +159,79 @@ func (e *Engine) collidesWithObstacleOrClosedExit(x, y float64) bool {
 	return false
 }
 
-// Update exécute un cycle (tick) de la simulation spatiale.
+// boundingCells retourne la plage de coordonnées [minCol, maxCol, minRow, maxRow]
+// des cellules 2D intersectant le cercle de rayon radius centré en (x, y).
+func (e *Engine) boundingCells(x, y, radius float64) (minCol, maxCol, minRow, maxRow int) {
+	cellW := WorldSize / float64(GridCols)
+	cellH := WorldSize / float64(GridRows)
+
+	minCol = int((x - radius) / cellW)
+	maxCol = int((x + radius) / cellW)
+	minRow = int((y - radius) / cellH)
+	maxRow = int((y + radius) / cellH)
+
+	if minCol < 0 {
+		minCol = 0
+	}
+	if maxCol >= GridCols {
+		maxCol = GridCols - 1
+	}
+	if minRow < 0 {
+		minRow = 0
+	}
+	if maxRow >= GridRows {
+		maxRow = GridRows - 1
+	}
+	return
+}
+
+// Update exécute un cycle (tick) de la simulation spatiale en exploitant la grille spatiale 1D.
 func (e *Engine) Update() {
+	e.newZombies = e.newZombies[:0]
+
+	// 0. Réinitialisation de la grille spatiale 1D
+	for i := range e.grid {
+		e.grid[i].FirstSurvivor = -1
+		e.grid[i].FirstZombie = -1
+	}
+
 	var sumX, sumY float64
 	var aliveCount float64
 	var aliveInRoomCount float64
 
-	for i := 0; i < len(e.survivors); i++ {
-		if e.survivors[i].Alive && !e.survivors[i].Escaped {
-			sumX += e.survivors[i].X
-			sumY += e.survivors[i].Y
+	cellW := WorldSize / float64(GridCols)
+	cellH := WorldSize / float64(GridRows)
+
+	// Insertion des survivants dans la grille + calcul barycentre
+	for i := range e.survivors {
+		s := &e.survivors[i]
+		e.wasAlerted[i] = s.IsAlerted
+		if s.Alive && !s.Escaped {
+			sumX += s.X
+			sumY += s.Y
 			aliveCount++
-			if e.survivors[i].X >= e.centerRoomX && e.survivors[i].X <= e.centerRoomX+e.centerRoomSize && e.survivors[i].Y >= e.centerRoomY && e.survivors[i].Y <= e.centerRoomY+e.centerRoomSize {
+			if s.X >= e.centerRoomX && s.X <= e.centerRoomX+e.centerRoomSize && s.Y >= e.centerRoomY && s.Y <= e.centerRoomY+e.centerRoomSize {
 				aliveInRoomCount++
 			}
+
+			col := int(s.X / cellW)
+			row := int(s.Y / cellH)
+			if col < 0 {
+				col = 0
+			} else if col >= GridCols {
+				col = GridCols - 1
+			}
+			if row < 0 {
+				row = 0
+			} else if row >= GridRows {
+				row = GridRows - 1
+			}
+			cellIdx := row*GridCols + col
+			e.survivorNext[i] = e.grid[cellIdx].FirstSurvivor
+			e.grid[cellIdx].FirstSurvivor = int32(i)
 		}
 	}
+
 	crowdCenterX := WorldSize / 2
 	crowdCenterY := WorldSize / 2
 	if aliveCount > 0 {
@@ -174,54 +239,93 @@ func (e *Engine) Update() {
 		crowdCenterY = sumY / aliveCount
 	}
 
-	wasAlerted := make([]bool, len(e.survivors))
-	for i := range e.survivors {
-		wasAlerted[i] = e.survivors[i].IsAlerted
+	// Insertion de la horde dans la grille
+	for i := range e.horde {
+		z := &e.horde[i]
+		if z.Active {
+			col := int(z.X / cellW)
+			row := int(z.Y / cellH)
+			if col < 0 {
+				col = 0
+			} else if col >= GridCols {
+				col = GridCols - 1
+			}
+			if row < 0 {
+				row = 0
+			} else if row >= GridRows {
+				row = GridRows - 1
+			}
+			cellIdx := row*GridCols + col
+			e.zombieNext[i] = e.grid[cellIdx].FirstZombie
+			e.grid[cellIdx].FirstZombie = int32(i)
+		}
 	}
 
-	// 1. Détection & Alerte irréversible
-	for i := 0; i < len(e.survivors); i++ {
-		if !e.survivors[i].Alive || e.survivors[i].Escaped || e.survivors[i].IsAlerted {
+	// 1. Détection & Alerte irréversible via la grille spatiale
+	awarenessSq := AwarenessRadius * AwarenessRadius
+	panicSpreadSq := PanicSpreadRadius * PanicSpreadRadius
+
+	for i := range e.survivors {
+		s := &e.survivors[i]
+		if !s.Alive || s.Escaped || s.IsAlerted {
 			continue
 		}
 
-		for zIdx := 0; zIdx < len(e.horde); zIdx++ {
-			z := &e.horde[zIdx]
-			if !z.Active {
-				continue
-			}
-			dx := e.survivors[i].X - z.X
-			dy := e.survivors[i].Y - z.Y
-			if dx*dx+dy*dy <= AwarenessRadius*AwarenessRadius {
-				e.survivors[i].IsAlerted = true
-				break
+		// Détection de zombies proches
+		minCol, maxCol, minRow, maxRow := e.boundingCells(s.X, s.Y, AwarenessRadius)
+		for r := minRow; r <= maxRow && !s.IsAlerted; r++ {
+			rowOffset := r * GridCols
+			for c := minCol; c <= maxCol && !s.IsAlerted; c++ {
+				for zIdx := e.grid[rowOffset+c].FirstZombie; zIdx != -1; zIdx = e.zombieNext[zIdx] {
+					z := &e.horde[zIdx]
+					if !z.Active {
+						continue
+					}
+					dx := s.X - z.X
+					dy := s.Y - z.Y
+					if dx*dx+dy*dy <= awarenessSq {
+						s.IsAlerted = true
+						break
+					}
+				}
 			}
 		}
 
-		if !e.survivors[i].IsAlerted {
-			for j := 0; j < len(e.survivors); j++ {
-				if i == j || !wasAlerted[j] {
-					continue
-				}
-				if !e.survivors[j].Alive || e.survivors[j].Escaped {
-					continue
-				}
+		// Propagation de la panique par voisins alertés
+		if !s.IsAlerted {
+			minColP, maxColP, minRowP, maxRowP := e.boundingCells(s.X, s.Y, PanicSpreadRadius)
+			for r := minRowP; r <= maxRowP && !s.IsAlerted; r++ {
+				rowOffset := r * GridCols
+				for c := minColP; c <= maxColP && !s.IsAlerted; c++ {
+					for j := e.grid[rowOffset+c].FirstSurvivor; j != -1; j = e.survivorNext[j] {
+						if int(j) == i || !e.wasAlerted[j] {
+							continue
+						}
+						other := &e.survivors[j]
+						if !other.Alive || other.Escaped {
+							continue
+						}
 
-				dx := e.survivors[i].X - e.survivors[j].X
-				dy := e.survivors[i].Y - e.survivors[j].Y
-				if dx*dx+dy*dy <= PanicSpreadRadius*PanicSpreadRadius {
-					if e.rng.Float64() < PanicSpreadChance {
-						e.survivors[i].IsAlerted = true
-						break
+						dx := s.X - other.X
+						dy := s.Y - other.Y
+						if dx*dx+dy*dy <= panicSpreadSq {
+							if e.rng.Float64() < PanicSpreadChance {
+								s.IsAlerted = true
+								break
+							}
+						}
 					}
 				}
 			}
 		}
 	}
 
-	// 2. Déplacement des survivants avec pénalité de fatigue lourde
-	for i := 0; i < len(e.survivors); i++ {
-		if !e.survivors[i].Alive || e.survivors[i].Escaped {
+	// 2. Déplacement des survivants avec pénalité de fatigue
+	repelSq := SurvivorRepelRadius * SurvivorRepelRadius
+
+	for i := range e.survivors {
+		s := &e.survivors[i]
+		if !s.Alive || s.Escaped {
 			continue
 		}
 
@@ -230,115 +334,131 @@ func (e *Engine) Update() {
 			if ex.IsClosed {
 				continue
 			}
-			dx := ex.X - e.survivors[i].X
-			dy := ex.Y - e.survivors[i].Y
-			if math.Sqrt(dx*dx+dy*dy) <= ex.R {
-				e.survivors[i].Escaped = true
+			dx := ex.X - s.X
+			dy := ex.Y - s.Y
+			if dx*dx+dy*dy <= ex.R*ex.R {
+				s.Escaped = true
 				e.escaped++
-				if e.survivors[i].IsSurvivalist {
+				if s.IsSurvivalist {
 					ex.HasSurvivalistIn = true
 				}
 				break
 			}
 		}
-		if e.survivors[i].Escaped {
+		if s.Escaped {
 			continue
 		}
 
 		// Humain épuisé : arrêt forcé et récupération lente
-		if e.survivors[i].IsExhausted {
-			e.survivors[i].Stamina += StaminaRecoveryRest
-			if e.survivors[i].Stamina >= StaminaResumeSprint {
-				e.survivors[i].IsExhausted = false
+		if s.IsExhausted {
+			s.Stamina += StaminaRecoveryRest
+			if s.Stamina >= StaminaResumeSprint {
+				s.IsExhausted = false
 			}
 			continue
 		}
 
 		dx, dy := 0.0, 0.0
 
-		if !e.survivors[i].IsAlerted {
-			if e.survivors[i].Stamina < MaxStamina {
-				e.survivors[i].Stamina++
+		if !s.IsAlerted {
+			if s.Stamina < MaxStamina {
+				s.Stamina++
 			}
-			e.survivors[i].WanderAng += (e.rng.Float64() - 0.5) * 0.2
-			dx = math.Cos(e.survivors[i].WanderAng) * (e.survivors[i].Speed * 0.4)
-			dy = math.Sin(e.survivors[i].WanderAng) * (e.survivors[i].Speed * 0.4)
+			s.WanderAng += (e.rng.Float64() - 0.5) * 0.2
+			dx = math.Cos(s.WanderAng) * (s.Speed * 0.4)
+			dy = math.Sin(s.WanderAng) * (s.Speed * 0.4)
 		} else {
 			// Sprint et dépense rapide
-			e.survivors[i].Stamina -= StaminaDrainSprint
-			if e.survivors[i].Stamina <= 0 {
-				e.survivors[i].Stamina = 0
-				e.survivors[i].IsExhausted = true
+			s.Stamina -= StaminaDrainSprint
+			if s.Stamina <= 0 {
+				s.Stamina = 0
+				s.IsExhausted = true
 				continue
 			}
 
 			fleeX, fleeY := 0.0, 0.0
 			threatCount := 0
-			for zIdx := 0; zIdx < len(e.horde); zIdx++ {
-				z := &e.horde[zIdx]
-				if !z.Active {
-					continue
-				}
-				zdx := e.survivors[i].X - z.X
-				zdy := e.survivors[i].Y - z.Y
-				zdist := math.Sqrt(zdx*zdx + zdy*zdy)
-				if zdist < SurvivorRepelRadius && zdist > 0.001 {
-					fleeX += (zdx / zdist)
-					fleeY += (zdy / zdist)
-					threatCount++
+
+			minCol, maxCol, minRow, maxRow := e.boundingCells(s.X, s.Y, SurvivorRepelRadius)
+			for r := minRow; r <= maxRow; r++ {
+				rowOffset := r * GridCols
+				for c := minCol; c <= maxCol; c++ {
+					for zIdx := e.grid[rowOffset+c].FirstZombie; zIdx != -1; zIdx = e.zombieNext[zIdx] {
+						z := &e.horde[zIdx]
+						if !z.Active {
+							continue
+						}
+						zdx := s.X - z.X
+						zdy := s.Y - z.Y
+						zdistSq := zdx*zdx + zdy*zdy
+						if zdistSq < repelSq && zdistSq > 0.0001 {
+							zdist := math.Sqrt(zdistSq)
+							fleeX += (zdx / zdist)
+							fleeY += (zdy / zdist)
+							threatCount++
+						}
+					}
 				}
 			}
 
 			if threatCount > 0 {
 				flen := math.Sqrt(fleeX*fleeX + fleeY*fleeY)
-				dx = (fleeX / flen) * e.survivors[i].Speed * 1.3
-				dy = (fleeY / flen) * e.survivors[i].Speed * 1.3
-			} else if e.survivors[i].IsSurvivalist {
-				bestDist := math.MaxFloat64
+				dx = (fleeX / flen) * s.Speed * 1.3
+				dy = (fleeY / flen) * s.Speed * 1.3
+			} else if s.IsSurvivalist {
+				bestDistSq := math.MaxFloat64
 				var targetExit *ExitZone
 				for exIdx := 0; exIdx < len(e.exits); exIdx++ {
 					ex := &e.exits[exIdx]
 					if ex.IsClosed {
 						continue
 					}
-					edx := ex.X - e.survivors[i].X
-					edy := ex.Y - e.survivors[i].Y
-					d := math.Sqrt(edx*edx + edy*edy)
-					if d < bestDist {
-						bestDist = d
+					edx := ex.X - s.X
+					edy := ex.Y - s.Y
+					d2 := edx*edx + edy*edy
+					if d2 < bestDistSq {
+						bestDistSq = d2
 						targetExit = ex
 					}
 				}
 
 				if targetExit != nil {
-					dx = ((targetExit.X - e.survivors[i].X) / bestDist) * e.survivors[i].Speed * e.survivors[i].Fear
-					dy = ((targetExit.Y - e.survivors[i].Y) / bestDist) * e.survivors[i].Speed * e.survivors[i].Fear
+					bestDist := math.Sqrt(bestDistSq)
+					dx = ((targetExit.X - s.X) / bestDist) * s.Speed * s.Fear
+					dy = ((targetExit.Y - s.Y) / bestDist) * s.Speed * s.Fear
 				}
 			} else {
-				bestSurvDist := math.MaxFloat64
+				bestSurvDistSq := 1800.0 * 1800.0
 				leaderIdx := -1
 
-				for j := 0; j < len(e.survivors); j++ {
-					other := &e.survivors[j]
-					if other.Alive && !other.Escaped && other.IsSurvivalist {
-						sdx := other.X - e.survivors[i].X
-						sdy := other.Y - e.survivors[i].Y
-						d := math.Sqrt(sdx*sdx + sdy*sdy)
-						if d < bestSurvDist {
-							bestSurvDist = d
-							leaderIdx = j
+				minColL, maxColL, minRowL, maxRowL := e.boundingCells(s.X, s.Y, 1800.0)
+				for r := minRowL; r <= maxRowL; r++ {
+					rowOffset := r * GridCols
+					for c := minColL; c <= maxColL; c++ {
+						for j := e.grid[rowOffset+c].FirstSurvivor; j != -1; j = e.survivorNext[j] {
+							other := &e.survivors[j]
+							if other.Alive && !other.Escaped && other.IsSurvivalist {
+								sdx := other.X - s.X
+								sdy := other.Y - s.Y
+								d2 := sdx*sdx + sdy*sdy
+								if d2 < bestSurvDistSq {
+									bestSurvDistSq = d2
+									leaderIdx = int(j)
+								}
+							}
 						}
 					}
 				}
 
-				if leaderIdx >= 0 && bestSurvDist < 1800.0 {
+				if leaderIdx >= 0 {
 					leader := &e.survivors[leaderIdx]
-					dx = ((leader.X - e.survivors[i].X) / bestSurvDist) * e.survivors[i].Speed * e.survivors[i].Fear
-					dy = ((leader.Y - e.survivors[i].Y) / bestSurvDist) * e.survivors[i].Speed * e.survivors[i].Fear
+					bestDist := math.Sqrt(bestSurvDistSq)
+					dx = ((leader.X - s.X) / bestDist) * s.Speed * s.Fear
+					dy = ((leader.Y - s.Y) / bestDist) * s.Speed * s.Fear
 				} else {
-					e.survivors[i].WanderAng += (e.rng.Float64() - 0.5) * 0.5
-					dx = math.Cos(e.survivors[i].WanderAng) * e.survivors[i].Speed * 0.8
-					dy = math.Sin(e.survivors[i].WanderAng) * e.survivors[i].Speed * 0.8
+					s.WanderAng += (e.rng.Float64() - 0.5) * 0.5
+					dx = math.Cos(s.WanderAng) * s.Speed * 0.8
+					dy = math.Sin(s.WanderAng) * s.Speed * 0.8
 				}
 			}
 		}
@@ -346,19 +466,20 @@ func (e *Engine) Update() {
 		dx += (e.rng.Float64() - 0.5) * 0.8
 		dy += (e.rng.Float64() - 0.5) * 0.8
 
-		nextX := e.survivors[i].X + dx
-		nextY := e.survivors[i].Y + dy
+		nextX := s.X + dx
+		nextY := s.Y + dy
 
-		if !e.collidesWithObstacleOrClosedExit(nextX, e.survivors[i].Y) {
-			e.survivors[i].X = nextX
+		if !e.collidesWithObstacleOrClosedExit(nextX, s.Y) {
+			s.X = nextX
 		}
-		if !e.collidesWithObstacleOrClosedExit(e.survivors[i].X, nextY) {
-			e.survivors[i].Y = nextY
+		if !e.collidesWithObstacleOrClosedExit(s.X, nextY) {
+			s.Y = nextY
 		}
 	}
 
-	// 3. Traque des zombies : priorité à la sortie de la pièce si vide
-	var newZombies []Zombie
+	// 3. Traque des zombies via la grille spatiale
+	visionSq := ZombieVisionRadius * ZombieVisionRadius
+	sealSq := ExitSealZombieRadius * ExitSealZombieRadius
 
 	for i := 0; i < len(e.horde); i++ {
 		z := &e.horde[i]
@@ -371,7 +492,7 @@ func (e *Engine) Update() {
 			if ex.HasSurvivalistIn && !ex.IsClosed {
 				edx := ex.X - z.X
 				edy := ex.Y - z.Y
-				if math.Sqrt(edx*edx+edy*edy) <= ExitSealZombieRadius {
+				if edx*edx+edy*edy <= sealSq {
 					ex.IsClosed = true
 				}
 			}
@@ -379,43 +500,50 @@ func (e *Engine) Update() {
 
 		inRoom := (z.X >= e.centerRoomX && z.X <= e.centerRoomX+e.centerRoomSize && z.Y >= e.centerRoomY && z.Y <= e.centerRoomY+e.centerRoomSize)
 
-		closestDist := math.MaxFloat64
+		closestDistSq := visionSq
 		closestIdx := -1
 
-		for j := 0; j < len(e.survivors); j++ {
-			s := &e.survivors[j]
-			if !s.Alive || s.Escaped {
-				continue
-			}
+		minCol, maxCol, minRow, maxRow := e.boundingCells(z.X, z.Y, ZombieVisionRadius)
+		for r := minRow; r <= maxRow; r++ {
+			rowOffset := r * GridCols
+			for c := minCol; c <= maxCol; c++ {
+				for j := e.grid[rowOffset+c].FirstSurvivor; j != -1; j = e.survivorNext[j] {
+					s := &e.survivors[j]
+					if !s.Alive || s.Escaped {
+						continue
+					}
 
-			// Si le zombie est enfermé et qu'il n'y a plus d'humains vivants dans la pièce, il ignore ceux de dehors pour d'abord sortir
-			if inRoom && aliveInRoomCount == 0 {
-				continue
-			}
+					// Si le zombie est enfermé et qu'il n'y a plus d'humains vivants dans la pièce, il ignore ceux de dehors pour d'abord sortir
+					if inRoom && aliveInRoomCount == 0 {
+						continue
+					}
 
-			dx := s.X - z.X
-			dy := s.Y - z.Y
-			dist := math.Sqrt(dx*dx + dy*dy)
+					dx := s.X - z.X
+					dy := s.Y - z.Y
+					d2 := dx*dx + dy*dy
 
-			if dist < closestDist {
-				closestDist = dist
-				closestIdx = j
+					if d2 < closestDistSq {
+						closestDistSq = d2
+						closestIdx = int(j)
+					}
+				}
 			}
 		}
 
 		dx, dy := 0.0, 0.0
 
 		// Cas 1 : Cible humaine directe et visible
-		if closestIdx >= 0 && closestDist < ZombieVisionRadius {
+		if closestIdx >= 0 {
+			closestDist := math.Sqrt(closestDistSq)
 			target := &e.survivors[closestIdx]
 			dx = ((target.X - z.X) / closestDist) * z.Speed
 			dy = ((target.Y - z.Y) / closestDist) * z.Speed
 
 			if closestDist <= InfectionRadius {
 				target.Alive = false
-				newZombies = append(newZombies, Zombie{
+				e.newZombies = append(e.newZombies, Zombie{
 					Active:    true,
-					ID:        int64(len(e.horde) + len(newZombies)),
+					ID:        int64(len(e.horde) + len(e.newZombies)),
 					X:         target.X,
 					Y:         target.Y,
 					Speed:     1.9 + e.rng.Float64()*0.7,
@@ -470,8 +598,8 @@ func (e *Engine) Update() {
 		}
 	}
 
-	if len(newZombies) > 0 {
-		e.horde = append(e.horde, newZombies...)
+	if len(e.newZombies) > 0 {
+		e.horde = append(e.horde, e.newZombies...)
 	}
 }
 

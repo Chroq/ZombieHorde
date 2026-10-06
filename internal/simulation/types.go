@@ -1,5 +1,10 @@
 package simulation
 
+type Cell struct {
+	FirstSurvivor int32
+	FirstZombie   int32
+}
+
 type Obstacle struct {
 	X float64 `json:"x"`
 	Y float64 `json:"y"`

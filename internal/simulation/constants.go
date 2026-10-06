@@ -4,7 +4,7 @@ const (
 	MasterSeed           int64   = 42
 	WorldSize            float64 = 5000.0
 	GridCols             int     = 100
-	GridRows             int     = 100
+	GridRows                     = GridCols
 	TotalSurvivors       int     = 10000
 	CenterRoomSurvivors  int     = 1500
 	InitialInfected      int     = 5
