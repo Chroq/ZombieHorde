@@ -39,6 +39,15 @@ func NewEngine(seed int64) *Engine {
 		survPoints: make([]Point, 0, TotalSurvivors),
 	}
 
+	e.initEnvironment()
+	e.initSurvivors()
+	e.initHorde()
+
+	return e
+}
+
+// initEnvironment configure les sas d'évacuation, la pièce centrale et les obstacles procéduraux.
+func (e *Engine) initEnvironment() {
 	e.exits = []ExitZone{
 		{ID: 1, X: 350.0, Y: 350.0, R: ExitRadius},
 		{ID: 2, X: WorldSize - 350.0, Y: 350.0, R: ExitRadius},
@@ -84,7 +93,10 @@ func NewEngine(seed int64) *Engine {
 		}
 		e.obstacles = append(e.obstacles, Obstacle{X: ox, Y: oy, W: w, H: h})
 	}
+}
 
+// initSurvivors instancie l'ensemble des survivants initiaux et leurs attributs.
+func (e *Engine) initSurvivors() {
 	e.survivors = make([]Survivor, TotalSurvivors)
 
 	for i := range TotalSurvivors {
@@ -123,7 +135,10 @@ func NewEngine(seed int64) *Engine {
 			WanderAng:     e.rng.Float64() * 2 * math.Pi,
 		}
 	}
+}
 
+// initHorde initialise les premiers infectés de la simulation.
+func (e *Engine) initHorde() {
 	e.horde = make([]Zombie, InitialInfected, TotalSurvivors)
 	for k := range InitialInfected {
 		e.survivors[k].Alive = false
@@ -136,8 +151,6 @@ func NewEngine(seed int64) *Engine {
 			WanderAng: e.rng.Float64() * 2 * math.Pi,
 		}
 	}
-
-	return e
 }
 
 func (e *Engine) collidesWithObstacleOrClosedExit(x, y float64) bool {
@@ -153,7 +166,7 @@ func (e *Engine) collidesWithObstacleOrClosedExit(x, y float64) bool {
 		if ex.IsClosed {
 			dx := ex.X - x
 			dy := ex.Y - y
-			if math.Sqrt(dx*dx+dy*dy) <= ex.R {
+			if dx*dx+dy*dy <= ExitRadiusSq {
 				return true
 			}
 		}
@@ -191,16 +204,21 @@ func (e *Engine) boundingCells(x, y, radius float64) (minCol, maxCol, minRow, ma
 func (e *Engine) Update() {
 	e.newZombies = e.newZombies[:0]
 
-	// 0. Réinitialisation de la grille spatiale 1D
+	crowdCenterX, crowdCenterY, aliveCount, aliveInRoomCount := e.rebuildSpatialGrid()
+	e.updateSurvivorAlerts()
+	e.moveSurvivors()
+	e.updateZombies(aliveCount, aliveInRoomCount, crowdCenterX, crowdCenterY)
+}
+
+// rebuildSpatialGrid réinitialise la grille spatiale, insère les survivants et zombies actifs,
+// et calcule le barycentre de la foule ainsi que le nombre de survivants vivants.
+func (e *Engine) rebuildSpatialGrid() (crowdCenterX, crowdCenterY float64, aliveCount, aliveInRoomCount int) {
 	for i := range e.grid {
 		e.grid[i].FirstSurvivor = -1
 		e.grid[i].FirstZombie = -1
 	}
 
 	var sumX, sumY float64
-	var aliveCount float64
-	var aliveInRoomCount float64
-
 	cellW := WorldSize / float64(GridCols)
 	cellH := WorldSize / float64(GridRows)
 
@@ -234,11 +252,11 @@ func (e *Engine) Update() {
 		}
 	}
 
-	crowdCenterX := WorldSize / 2
-	crowdCenterY := WorldSize / 2
+	crowdCenterX = WorldSize / 2
+	crowdCenterY = WorldSize / 2
 	if aliveCount > 0 {
-		crowdCenterX = sumX / aliveCount
-		crowdCenterY = sumY / aliveCount
+		crowdCenterX = sumX / float64(aliveCount)
+		crowdCenterY = sumY / float64(aliveCount)
 	}
 
 	// Insertion de la horde dans la grille
@@ -263,9 +281,13 @@ func (e *Engine) Update() {
 		}
 	}
 
-	// 1. Détection & Alerte irréversible via la grille spatiale
-	awarenessSq := AwarenessRadius * AwarenessRadius
-	panicSpreadSq := PanicSpreadRadius * PanicSpreadRadius
+	return crowdCenterX, crowdCenterY, aliveCount, aliveInRoomCount
+}
+
+// updateSurvivorAlerts gère la détection des zombies par les survivants et la propagation de la panique.
+func (e *Engine) updateSurvivorAlerts() {
+	awarenessSq := AwarenessRadiusSq
+	panicSpreadSq := PanicSpreadRadiusSq
 
 	for i := range e.survivors {
 		s := &e.survivors[i]
@@ -321,9 +343,39 @@ func (e *Engine) Update() {
 			}
 		}
 	}
+}
 
-	// 2. Déplacement des survivants avec pénalité de fatigue
-	repelSq := SurvivorRepelRadius * SurvivorRepelRadius
+// findNearestSurvivalist recherche le survivaliste le plus proche dans un rayon donné.
+func (e *Engine) findNearestSurvivalist(sx, sy float64) (leaderIdx int, bestDistSq float64) {
+	const searchRadius = 1800.0
+	const searchRadiusSq = searchRadius * searchRadius
+	bestDistSq = searchRadiusSq
+	leaderIdx = -1
+
+	minColL, maxColL, minRowL, maxRowL := e.boundingCells(sx, sy, searchRadius)
+	for r := minRowL; r <= maxRowL; r++ {
+		rowOffset := r * GridCols
+		for c := minColL; c <= maxColL; c++ {
+			for j := e.grid[rowOffset+c].FirstSurvivor; j != -1; j = e.survivorNext[j] {
+				other := &e.survivors[j]
+				if other.Alive && !other.Escaped && other.IsSurvivalist {
+					sdx := other.X - sx
+					sdy := other.Y - sy
+					d2 := sdx*sdx + sdy*sdy
+					if d2 < bestDistSq {
+						bestDistSq = d2
+						leaderIdx = int(j)
+					}
+				}
+			}
+		}
+	}
+	return leaderIdx, bestDistSq
+}
+
+// moveSurvivors gère l'évacuation, la fatigue, les trajectoires d'évitement et les déplacements des humains.
+func (e *Engine) moveSurvivors() {
+	repelSq := SurvivorRepelRadiusSq
 
 	for i := range e.survivors {
 		s := &e.survivors[i]
@@ -338,7 +390,7 @@ func (e *Engine) Update() {
 			}
 			dx := ex.X - s.X
 			dy := ex.Y - s.Y
-			if dx*dx+dy*dy <= ex.R*ex.R {
+			if dx*dx+dy*dy <= ExitRadiusSq {
 				s.Escaped = true
 				e.escaped++
 				if s.IsSurvivalist {
@@ -394,6 +446,7 @@ func (e *Engine) Update() {
 						zdy := s.Y - z.Y
 						zdistSq := zdx*zdx + zdy*zdy
 						if zdistSq < repelSq && zdistSq > 0.0001 {
+							// Normalisation vectorielle de fuite
 							zdist := math.Sqrt(zdistSq)
 							fleeX += (zdx / zdist)
 							fleeY += (zdy / zdist)
@@ -430,28 +483,7 @@ func (e *Engine) Update() {
 					dy = ((targetExit.Y - s.Y) / bestDist) * s.Speed * s.Fear
 				}
 			} else {
-				bestSurvDistSq := 1800.0 * 1800.0
-				leaderIdx := -1
-
-				minColL, maxColL, minRowL, maxRowL := e.boundingCells(s.X, s.Y, 1800.0)
-				for r := minRowL; r <= maxRowL; r++ {
-					rowOffset := r * GridCols
-					for c := minColL; c <= maxColL; c++ {
-						for j := e.grid[rowOffset+c].FirstSurvivor; j != -1; j = e.survivorNext[j] {
-							other := &e.survivors[j]
-							if other.Alive && !other.Escaped && other.IsSurvivalist {
-								sdx := other.X - s.X
-								sdy := other.Y - s.Y
-								d2 := sdx*sdx + sdy*sdy
-								if d2 < bestSurvDistSq {
-									bestSurvDistSq = d2
-									leaderIdx = int(j)
-								}
-							}
-						}
-					}
-				}
-
+				leaderIdx, bestSurvDistSq := e.findNearestSurvivalist(s.X, s.Y)
 				if leaderIdx >= 0 {
 					leader := &e.survivors[leaderIdx]
 					bestDist := math.Sqrt(bestSurvDistSq)
@@ -478,10 +510,46 @@ func (e *Engine) Update() {
 			s.Y = nextY
 		}
 	}
+}
 
-	// 3. Traque des zombies via la grille spatiale
-	visionSq := ZombieVisionRadius * ZombieVisionRadius
-	sealSq := ExitSealZombieRadius * ExitSealZombieRadius
+// findClosestSurvivor localise le survivant vivant le plus proche à portée de vue du zombie.
+func (e *Engine) findClosestSurvivor(zx, zy, visionSq float64, inRoom bool, aliveInRoomCount int) (closestIdx int, closestDistSq float64) {
+	closestDistSq = visionSq
+	closestIdx = -1
+
+	minCol, maxCol, minRow, maxRow := e.boundingCells(zx, zy, ZombieVisionRadius)
+	for r := minRow; r <= maxRow; r++ {
+		rowOffset := r * GridCols
+		for c := minCol; c <= maxCol; c++ {
+			for j := e.grid[rowOffset+c].FirstSurvivor; j != -1; j = e.survivorNext[j] {
+				s := &e.survivors[j]
+				if !s.Alive || s.Escaped {
+					continue
+				}
+
+				// Si le zombie est enfermé et qu'il n'y a plus d'humains vivants dans la pièce, il ignore ceux de dehors pour d'abord sortir
+				if inRoom && aliveInRoomCount == 0 {
+					continue
+				}
+
+				dx := s.X - zx
+				dy := s.Y - zy
+				d2 := dx*dx + dy*dy
+
+				if d2 < closestDistSq {
+					closestDistSq = d2
+					closestIdx = int(j)
+				}
+			}
+		}
+	}
+	return closestIdx, closestDistSq
+}
+
+// updateZombies pilote la traque, les infections et les mouvements de la horde.
+func (e *Engine) updateZombies(aliveCount, aliveInRoomCount int, crowdCenterX, crowdCenterY float64) {
+	visionSq := ZombieVisionRadiusSq
+	sealSq := ExitSealZombieRadiusSq
 
 	for i := 0; i < len(e.horde); i++ {
 		z := &e.horde[i]
@@ -502,46 +570,16 @@ func (e *Engine) Update() {
 
 		inRoom := (z.X >= e.centerRoomX && z.X <= e.centerRoomX+e.centerRoomSize && z.Y >= e.centerRoomY && z.Y <= e.centerRoomY+e.centerRoomSize)
 
-		closestDistSq := visionSq
-		closestIdx := -1
-
-		minCol, maxCol, minRow, maxRow := e.boundingCells(z.X, z.Y, ZombieVisionRadius)
-		for r := minRow; r <= maxRow; r++ {
-			rowOffset := r * GridCols
-			for c := minCol; c <= maxCol; c++ {
-				for j := e.grid[rowOffset+c].FirstSurvivor; j != -1; j = e.survivorNext[j] {
-					s := &e.survivors[j]
-					if !s.Alive || s.Escaped {
-						continue
-					}
-
-					// Si le zombie est enfermé et qu'il n'y a plus d'humains vivants dans la pièce, il ignore ceux de dehors pour d'abord sortir
-					if inRoom && aliveInRoomCount == 0 {
-						continue
-					}
-
-					dx := s.X - z.X
-					dy := s.Y - z.Y
-					d2 := dx*dx + dy*dy
-
-					if d2 < closestDistSq {
-						closestDistSq = d2
-						closestIdx = int(j)
-					}
-				}
-			}
-		}
+		closestIdx, closestDistSq := e.findClosestSurvivor(z.X, z.Y, visionSq, inRoom, aliveInRoomCount)
 
 		dx, dy := 0.0, 0.0
 
 		// Cas 1 : Cible humaine directe et visible
 		if closestIdx >= 0 {
-			closestDist := math.Sqrt(closestDistSq)
 			target := &e.survivors[closestIdx]
-			dx = ((target.X - z.X) / closestDist) * z.Speed
-			dy = ((target.Y - z.Y) / closestDist) * z.Speed
 
-			if closestDist <= InfectionRadius {
+			// Test direct au carré pour l'infection
+			if closestDistSq <= InfectionRadiusSq {
 				target.Alive = false
 				e.newZombies = append(e.newZombies, Zombie{
 					Active:    true,
@@ -552,6 +590,11 @@ func (e *Engine) Update() {
 					WanderAng: e.rng.Float64() * 2 * math.Pi,
 				})
 			}
+
+			// Normalisation vectorielle nécessaire pour orienter la vitesse du zombie
+			closestDist := math.Sqrt(closestDistSq)
+			dx = ((target.X - z.X) / closestDist) * z.Speed
+			dy = ((target.Y - z.Y) / closestDist) * z.Speed
 		} else if inRoom && aliveInRoomCount == 0 {
 			// Cas 2 : Zombie enfermé dans une pièce dépeuplée -> cap direct sur la porte la plus proche
 			targetDoorX := e.doorNorthX
@@ -563,8 +606,10 @@ func (e *Engine) Update() {
 
 			ddx := targetDoorX - z.X
 			ddy := targetDoorY - z.Y
-			ddist := math.Sqrt(ddx*ddx + ddy*ddy)
-			if ddist > 2.0 {
+			ddistSq := ddx*ddx + ddy*ddy
+			// Test direct de distance au carré (> 2.0^2 = 4.0), racine calculée uniquement pour normaliser
+			if ddistSq > 4.0 {
+				ddist := math.Sqrt(ddistSq)
 				dx = (ddx / ddist) * z.Speed
 				dy = (ddy / ddist) * z.Speed
 			}
@@ -572,8 +617,9 @@ func (e *Engine) Update() {
 			// Cas 3 : À l'extérieur ou foule en approche -> cap vers le centre de gravité humain
 			cdx := crowdCenterX - z.X
 			cdy := crowdCenterY - z.Y
-			cdist := math.Sqrt(cdx*cdx + cdy*cdy)
-			if cdist > 1.0 {
+			cdistSq := cdx*cdx + cdy*cdy
+			// Test direct au carré (> 1.0^2 = 1.0), Atan2 se charge de la direction sans racine carrée
+			if cdistSq > 1.0 {
 				angleToCrowd := math.Atan2(cdy, cdx) + (e.rng.Float64()-0.5)*0.6
 				dx = math.Cos(angleToCrowd) * z.Speed * 0.9
 				dy = math.Sin(angleToCrowd) * z.Speed * 0.9
