@@ -6,9 +6,14 @@ import (
 	"log"
 
 	"github.com/Chroq/zombie-horde/internal/server"
+
+	"net/http"
+	_ "net/http/pprof"
 )
 
 func main() {
+	go func() { _ = http.ListenAndServe("localhost:6060", nil) }()
+
 	port := flag.Int("port", 8080, "Port d'écoute du serveur HTTP et WebSocket")
 	staticDir := flag.String("static", ".", "Chemin vers le répertoire contenant index.html")
 	flag.Parse()
