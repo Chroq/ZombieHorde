@@ -7,18 +7,14 @@ import (
 
 // Engine encapsule l'état complet et le moteur de calcul d'une simulation ZombieHorde.
 type Engine struct {
-	// Grille spatiale 1D contiguë (Spatial Hashing par linked-cells sans pointeurs)
-	grid         [GridCols * GridRows]Cell
-	survivorNext [TotalSurvivors]int32
-	zombieNext   [TotalSurvivors]int32
-	wasAlerted   [TotalSurvivors]bool
-	newZombies   []Zombie
-
 	rng            *rand.Rand
-	horde          []Zombie
-	survivors      []Survivor
 	obstacles      []Obstacle
+	horde          []Zombie
 	exits          []ExitZone
+	newZombies     []Zombie
+	survivors      []Survivor
+	heatmap        [GridCols * GridRows]int
+	survPoints     []Point
 	escaped        int
 	centerRoomX    float64
 	centerRoomY    float64
@@ -27,6 +23,10 @@ type Engine struct {
 	doorNorthY     float64
 	doorSouthX     float64
 	doorSouthY     float64
+	grid           [GridCols * GridRows]Cell
+	survivorNext   [TotalSurvivors]int32
+	zombieNext     [TotalSurvivors]int32
+	wasAlerted     [TotalSurvivors]bool
 }
 
 // NewEngine instancie et initialise une nouvelle simulation déterministe à partir d'une graine.
@@ -34,7 +34,9 @@ func NewEngine(seed int64) *Engine {
 	e := &Engine{
 		rng:        rand.New(rand.NewSource(seed)),
 		escaped:    0,
-		newZombies: make([]Zombie, 0, 128),
+		obstacles:  make([]Obstacle, 0, 6+ObstacleCount),
+		newZombies: make([]Zombie, 0, TotalSurvivors),
+		survPoints: make([]Point, 0, TotalSurvivors),
 	}
 
 	e.exits = []ExitZone{
@@ -55,17 +57,17 @@ func NewEngine(seed int64) *Engine {
 	e.doorSouthX = e.centerRoomX + (e.centerRoomSize / 2)
 	e.doorSouthY = e.centerRoomY + e.centerRoomSize + 15.0
 
-	e.obstacles = []Obstacle{
+	e.obstacles = append(e.obstacles,
 		// Porte Nord
-		{X: e.centerRoomX, Y: e.centerRoomY, W: (e.centerRoomSize - doorSize) / 2, H: 30},
-		{X: e.centerRoomX + (e.centerRoomSize+doorSize)/2, Y: e.centerRoomY, W: (e.centerRoomSize - doorSize) / 2, H: 30},
+		Obstacle{X: e.centerRoomX, Y: e.centerRoomY, W: (e.centerRoomSize - doorSize) / 2, H: 30},
+		Obstacle{X: e.centerRoomX + (e.centerRoomSize+doorSize)/2, Y: e.centerRoomY, W: (e.centerRoomSize - doorSize) / 2, H: 30},
 		// Porte Sud
-		{X: e.centerRoomX, Y: e.centerRoomY + e.centerRoomSize - 30, W: (e.centerRoomSize - doorSize) / 2, H: 30},
-		{X: e.centerRoomX + (e.centerRoomSize+doorSize)/2, Y: e.centerRoomY + e.centerRoomSize - 30, W: (e.centerRoomSize - doorSize) / 2, H: 30},
+		Obstacle{X: e.centerRoomX, Y: e.centerRoomY + e.centerRoomSize - 30, W: (e.centerRoomSize - doorSize) / 2, H: 30},
+		Obstacle{X: e.centerRoomX + (e.centerRoomSize+doorSize)/2, Y: e.centerRoomY + e.centerRoomSize - 30, W: (e.centerRoomSize - doorSize) / 2, H: 30},
 		// Murs latéraux
-		{X: e.centerRoomX, Y: e.centerRoomY, W: 30, H: e.centerRoomSize},
-		{X: e.centerRoomX + e.centerRoomSize - 30, Y: e.centerRoomY, W: 30, H: e.centerRoomSize},
-	}
+		Obstacle{X: e.centerRoomX, Y: e.centerRoomY, W: 30, H: e.centerRoomSize},
+		Obstacle{X: e.centerRoomX + e.centerRoomSize - 30, Y: e.centerRoomY, W: 30, H: e.centerRoomSize},
+	)
 
 	for range ObstacleCount {
 		w := 150.0 + e.rng.Float64()*350.0
@@ -122,7 +124,7 @@ func NewEngine(seed int64) *Engine {
 		}
 	}
 
-	e.horde = make([]Zombie, InitialInfected)
+	e.horde = make([]Zombie, InitialInfected, TotalSurvivors)
 	for k := range InitialInfected {
 		e.survivors[k].Alive = false
 		e.horde[k] = Zombie{
@@ -605,7 +607,7 @@ func (e *Engine) Update() {
 
 // GenerateHeatmap génère la grille de densité de la horde de zombies.
 func (e *Engine) GenerateHeatmap() []int {
-	grid := make([]int, GridCols*GridRows)
+	clear(e.heatmap[:])
 	cellW := WorldSize / float64(GridCols)
 	cellH := WorldSize / float64(GridRows)
 
@@ -617,10 +619,10 @@ func (e *Engine) GenerateHeatmap() []int {
 		gy := int(z.Y / cellH)
 
 		if gx >= 0 && gx < GridCols && gy >= 0 && gy < GridRows {
-			grid[gy*GridCols+gx]++
+			e.heatmap[gy*GridCols+gx]++
 		}
 	}
-	return grid
+	return e.heatmap[:]
 }
 
 // GetSurvivorCounts calcule et retourne les métriques de répartition de la population humaine.
@@ -660,10 +662,10 @@ func (e *Engine) BuildFramePayload(currentTPS int) FramePayload {
 	healthy, survCount, normCount, alertedCount, exhaustedCount := e.GetSurvivorCounts()
 	isFinished := (healthy == 0)
 
-	survPoints := make([]Point, 0, healthy)
+	e.survPoints = e.survPoints[:0]
 	for _, s := range e.survivors {
 		if s.Alive && !s.Escaped {
-			survPoints = append(survPoints, Point{
+			e.survPoints = append(e.survPoints, Point{
 				X:             int16(s.X),
 				Y:             int16(s.Y),
 				IsSurvivalist: s.IsSurvivalist,
@@ -700,7 +702,7 @@ func (e *Engine) BuildFramePayload(currentTPS int) FramePayload {
 		Obstacles: e.obstacles,
 		Exits:     e.exits,
 		Heatmap:   e.GenerateHeatmap(),
-		Survivors: survPoints,
+		Survivors: e.survPoints,
 	}
 }
 

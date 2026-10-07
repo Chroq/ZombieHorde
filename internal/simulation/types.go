@@ -30,17 +30,18 @@ type Zombie struct {
 }
 
 type Survivor struct {
-	Escaped       bool
 	ID            int64
+	X             float64
+	Y             float64
+	Speed         float64
+	Fear          float64
+	WanderAng     float64
+	Stamina       int16
+	Escaped       bool
 	Alive         bool
 	IsSurvivalist bool
 	IsAlerted     bool
 	IsExhausted   bool
-	Stamina       int16
-	X, Y          float64
-	Speed         float64
-	Fear          float64
-	WanderAng     float64
 }
 
 type Point struct {
@@ -66,13 +67,13 @@ type Stats struct {
 }
 
 type FramePayload struct {
-	TPS       int        `json:"tps"`
-	WorldSize float64    `json:"world_size"`
-	GridCols  int        `json:"grid_cols"`
-	GridRows  int        `json:"grid_rows"`
-	Stats     Stats      `json:"stats"`
 	Obstacles []Obstacle `json:"obstacles"`
 	Exits     []ExitZone `json:"exits"`
 	Heatmap   []int      `json:"heatmap"`
 	Survivors []Point    `json:"survivors"`
+	Stats     Stats      `json:"stats"`
+	TPS       int        `json:"tps"`
+	WorldSize float64    `json:"world_size"`
+	GridCols  int        `json:"grid_cols"`
+	GridRows  int        `json:"grid_rows"`
 }

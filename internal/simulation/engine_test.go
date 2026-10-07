@@ -36,6 +36,24 @@ func BenchmarkSimulation50Ticks(b *testing.B) {
 	}
 }
 
+func BenchmarkGenerateHeatmap(b *testing.B) {
+	b.ReportAllocs()
+	engine := simulation.NewEngine(simulation.MasterSeed)
+
+	for b.Loop() {
+		engine.GenerateHeatmap()
+	}
+}
+
+func BenchmarkBuildFramePayload(b *testing.B) {
+	b.ReportAllocs()
+	engine := simulation.NewEngine(simulation.MasterSeed)
+
+	for b.Loop() {
+		engine.BuildFramePayload(30)
+	}
+}
+
 func TestDeterministicRun(t *testing.T) {
 	e1 := simulation.NewEngine(simulation.MasterSeed)
 	e2 := simulation.NewEngine(simulation.MasterSeed)
