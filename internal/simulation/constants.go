@@ -1,5 +1,11 @@
 package simulation
 
+import "runtime"
+
+var (
+	WorkerCount = runtime.NumCPU() // Dimensionné strictement sur runtime.NumCPU() (ex. 8 cœurs)
+)
+
 const (
 	MasterSeed             int64   = 42
 	WorldSize              float64 = 5000.0
@@ -7,7 +13,6 @@ const (
 	GridRows                       = GridCols
 	TotalSurvivors         int     = 10000
 	CenterRoomSurvivors    int     = 1500
-	WorkerCount            int     = 8 // Découpage par défaut en 8 workers (8 tranches de 1 250 entités)
 	InitialInfected        int     = 5
 	SurvivalistRatio       float64 = 0.12
 	ObstacleCount          int     = 35

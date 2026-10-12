@@ -1,11 +1,13 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/Chroq/zombie-horde/internal/simulation"
@@ -66,7 +68,11 @@ func (s *Server) resolveStaticDir() string {
 func (s *Server) handleWebSocket(ws *websocket.Conn) {
 	defer ws.Close()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	engine := simulation.NewEngine(simulation.MasterSeed)
+	defer engine.Close()
 
 	ticker := time.NewTicker(time.Second / time.Duration(simulation.TargetFPS))
 	defer ticker.Stop()
@@ -75,25 +81,46 @@ func (s *Server) handleWebSocket(ws *websocket.Conn) {
 	lastCheck := time.Now()
 	currentTPS := 0
 
-	for range ticker.C {
-		engine.Update()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Coordonner la fin du calcul de frame avec sync.WaitGroup avant la diffusion réseau
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				engine.Update()
+			}()
+			wg.Wait()
 
-		frames++
-		if time.Since(lastCheck) >= time.Second {
-			currentTPS = frames
-			frames = 0
-			lastCheck = time.Now()
-		}
+			frames++
+			if time.Since(lastCheck) >= time.Second {
+				currentTPS = frames
+				frames = 0
+				lastCheck = time.Now()
+			}
 
-		payload := engine.BuildFramePayload(currentTPS)
+			payload := engine.BuildFramePayload(currentTPS)
 
-		data, err := json.Marshal(payload)
-		if err != nil {
-			break
-		}
+			data, err := json.Marshal(payload)
+			if err != nil {
+				cancel()
+				return
+			}
 
-		if err := websocket.Message.Send(ws, string(data)); err != nil {
-			break
+			// Diffusion réseau
+			if err := websocket.Message.Send(ws, string(data)); err != nil {
+				cancel()
+				return
+			}
+
+			// Propager l'annulation précoce via context.WithCancel dès la fin de partie
+			if payload.Stats.IsFinished {
+				cancel()
+				return
+			}
 		}
 	}
 }

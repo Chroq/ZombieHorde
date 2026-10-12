@@ -1,58 +1,136 @@
 package simulation
 
 import (
+	"context"
 	"math"
 	"math/rand"
+	"runtime"
+	"sync"
 )
 
 // Engine encapsule l'état complet et le moteur de calcul d'une simulation ZombieHorde.
 type Engine struct {
-	rng            *rand.Rand
-	obstacles      []Obstacle
-	horde          []Zombie
-	exits          []ExitZone
-	newZombies     []Zombie
-	survivors      []Survivor
-	heatmap        [GridCols * GridRows]int
-	survPoints     []Point
-	escaped        int
-	centerRoomX    float64
-	centerRoomY    float64
-	centerRoomSize float64
-	doorNorthX     float64
-	doorNorthY     float64
-	doorSouthX     float64
-	doorSouthY     float64
-	grid           [GridCols * GridRows]Cell
-	survivorNext   [TotalSurvivors]int32
-	zombieNext     [TotalSurvivors]int32
-	wasAlerted     [TotalSurvivors]bool
-	workerCount    int
-	chunks         []SurvivorChunk
+	rng              *rand.Rand
+	obstacles        []Obstacle
+	horde            []Zombie
+	exits            []ExitZone
+	newZombies       []Zombie
+	survivors        []Survivor
+	heatmap          [GridCols * GridRows]int
+	survPoints       []Point
+	escaped          int
+	centerRoomX      float64
+	centerRoomY      float64
+	centerRoomSize   float64
+	doorNorthX       float64
+	doorNorthY       float64
+	doorSouthX       float64
+	doorSouthY       float64
+	grid             [GridCols * GridRows]Cell
+	survivorNext     [TotalSurvivors]int32
+	zombieNext       [TotalSurvivors]int32
+	wasAlerted       [TotalSurvivors]bool
+	posSnapshotX     [TotalSurvivors]float64
+	posSnapshotY     [TotalSurvivors]float64
+	workerCount      int
+	chunks           []SurvivorChunk
+	workerRng        []*rand.Rand
+	workerEscaped    []int
+	workerExitsArmed [][4]bool
+	workerStartCh    []chan struct{}
+	workerDoneWg     sync.WaitGroup
+	workerCtx        context.Context
+	workerCancel     context.CancelFunc
+	closed           bool
 }
 
-// NewEngineWithWorkers instancie une nouvelle simulation avec un nombre explicite de workers
+// NewEngineWithWorkers instancie une nouvelle simulation avec un pool de workers borné
 // pour découper équitablement la population de survivants.
 func NewEngineWithWorkers(seed int64, numWorkers int) *Engine {
+	if numWorkers <= 0 {
+		numWorkers = runtime.NumCPU()
+	}
+	if numWorkers > TotalSurvivors {
+		numWorkers = TotalSurvivors
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
 	e := &Engine{
-		rng:        rand.New(rand.NewSource(seed)),
-		escaped:    0,
-		obstacles:  make([]Obstacle, 0, 6+ObstacleCount),
-		newZombies: make([]Zombie, 0, TotalSurvivors),
-		survPoints: make([]Point, 0, TotalSurvivors),
+		rng:              rand.New(rand.NewSource(seed)),
+		escaped:          0,
+		obstacles:        make([]Obstacle, 0, 6+ObstacleCount),
+		newZombies:       make([]Zombie, 0, TotalSurvivors),
+		survPoints:       make([]Point, 0, TotalSurvivors),
+		workerCount:      numWorkers,
+		workerCtx:        ctx,
+		workerCancel:     cancel,
+		workerRng:        make([]*rand.Rand, numWorkers),
+		workerEscaped:    make([]int, numWorkers),
+		workerExitsArmed: make([][4]bool, numWorkers),
+		workerStartCh:    make([]chan struct{}, numWorkers),
+	}
+
+	for i := 0; i < numWorkers; i++ {
+		e.workerRng[i] = rand.New(rand.NewSource(seed + int64(i)*10007 + 1))
+		e.workerStartCh[i] = make(chan struct{}, 1)
 	}
 
 	e.initEnvironment()
 	e.initSurvivors()
 	e.initHorde()
 	e.initSurvivorChunks(numWorkers)
+	e.startWorkerPool()
+
+	runtime.SetFinalizer(e, func(eng *Engine) {
+		eng.Close()
+	})
 
 	return e
 }
 
-// NewEngine instancie et initialise une nouvelle simulation déterministe à partir d'une graine.
+// NewEngine instancie et initialise une nouvelle simulation déterministe
+// bornée sur runtime.NumCPU() cœurs.
 func NewEngine(seed int64) *Engine {
-	return NewEngineWithWorkers(seed, WorkerCount)
+	return NewEngineWithWorkers(seed, runtime.NumCPU())
+}
+
+// WorkerCount retourne le nombre de workers alloués au pool.
+func (e *Engine) WorkerCount() int {
+	return e.workerCount
+}
+
+// Close arrête proprement les goroutines persistantes du Worker Pool.
+func (e *Engine) Close() {
+	if e.closed {
+		return
+	}
+	e.closed = true
+	if e.workerCancel != nil {
+		e.workerCancel()
+	}
+}
+
+// startWorkerPool lance les goroutines persistantes bornées sur runtime.NumCPU().
+func (e *Engine) startWorkerPool() {
+	for i := 0; i < e.workerCount; i++ {
+		workerID := i
+		go e.workerLoop(workerID)
+	}
+}
+
+func (e *Engine) workerLoop(workerID int) {
+	chunk := e.chunks[workerID]
+	for {
+		select {
+		case <-e.workerCtx.Done():
+			return
+		case <-e.workerStartCh[workerID]:
+			e.updateSurvivorAlertsChunk(workerID, chunk)
+			e.moveSurvivorsChunk(workerID, chunk)
+			e.workerDoneWg.Done()
+		}
+	}
 }
 
 // initEnvironment configure les sas d'évacuation, la pièce centrale et les obstacles procéduraux.
@@ -209,14 +287,39 @@ func (e *Engine) boundingCells(x, y, radius float64) (minCol, maxCol, minRow, ma
 	return
 }
 
-// Update exécute un cycle (tick) de la simulation spatiale en exploitant la grille spatiale 1D.
+// Update exécute un cycle (tick) de la simulation spatiale en exploitant la grille spatiale 1D
+// et en distribuant les lots de survivants sur le Worker Pool borné synchronisé par sync.WaitGroup.
 func (e *Engine) Update() {
 	e.newZombies = e.newZombies[:0]
 
 	crowdCenterX, crowdCenterY, aliveCount, aliveInRoomCount := e.rebuildSpatialGrid()
-	e.updateSurvivorAlerts()
-	e.moveSurvivors()
+
+	// Distribution des lots de survivants sur le Worker Pool borné
+	e.workerDoneWg.Add(e.workerCount)
+	for i := 0; i < e.workerCount; i++ {
+		e.workerStartCh[i] <- struct{}{}
+	}
+	e.workerDoneWg.Wait()
+
+	// Réduction sans contention des données produites par les workers
+	e.reduceWorkerResults()
+
 	e.updateZombies(aliveCount, aliveInRoomCount, crowdCenterX, crowdCenterY)
+}
+
+// reduceWorkerResults agrège les statistiques des workers (rescapés, armement des sas) sans contention.
+func (e *Engine) reduceWorkerResults() {
+	for w := 0; w < e.workerCount; w++ {
+		e.escaped += e.workerEscaped[w]
+		e.workerEscaped[w] = 0
+
+		for exIdx := range e.exits {
+			if e.workerExitsArmed[w][exIdx] {
+				e.exits[exIdx].HasSurvivalistIn = true
+				e.workerExitsArmed[w][exIdx] = false
+			}
+		}
+	}
 }
 
 // rebuildSpatialGrid réinitialise la grille spatiale, insère les survivants et zombies actifs,
@@ -235,6 +338,8 @@ func (e *Engine) rebuildSpatialGrid() (crowdCenterX, crowdCenterY float64, alive
 	for i := range e.survivors {
 		s := &e.survivors[i]
 		e.wasAlerted[i] = s.IsAlerted
+		e.posSnapshotX[i] = s.X
+		e.posSnapshotY[i] = s.Y
 		if s.Alive && !s.Escaped {
 			sumX += s.X
 			sumY += s.Y
@@ -323,18 +428,12 @@ func (e *Engine) SurvivorSlice(chunk SurvivorChunk) []Survivor {
 	return e.survivors[chunk.Start:chunk.End]
 }
 
-// updateSurvivorAlerts gère la détection des zombies par les survivants et la propagation de la panique
-// en itérant sur les sous-tranches indépendantes attribuées aux workers.
-func (e *Engine) updateSurvivorAlerts() {
-	for _, chunk := range e.chunks {
-		e.updateSurvivorAlertsChunk(chunk)
-	}
-}
-
-// updateSurvivorAlertsChunk traite la détection et la panique pour une sous-tranche indépendante de survivants.
-func (e *Engine) updateSurvivorAlertsChunk(chunk SurvivorChunk) {
+// updateSurvivorAlertsChunk traite la détection et la panique pour une sous-tranche indépendante de survivants
+// en s'appuyant sur le générateur pseudo-aléatoire dédié au worker et les snapshots de position.
+func (e *Engine) updateSurvivorAlertsChunk(workerID int, chunk SurvivorChunk) {
 	awarenessSq := AwarenessRadiusSq
 	panicSpreadSq := PanicSpreadRadiusSq
+	rng := e.workerRng[workerID]
 
 	for i := chunk.Start; i < chunk.End; i++ {
 		s := &e.survivors[i]
@@ -343,7 +442,7 @@ func (e *Engine) updateSurvivorAlertsChunk(chunk SurvivorChunk) {
 		}
 
 		// Détection de zombies proches
-		minCol, maxCol, minRow, maxRow := e.boundingCells(s.X, s.Y, AwarenessRadius)
+		minCol, maxCol, minRow, maxRow := e.boundingCells(e.posSnapshotX[i], e.posSnapshotY[i], AwarenessRadius)
 		for r := minRow; r <= maxRow && !s.IsAlerted; r++ {
 			rowOffset := r * GridCols
 			for c := minCol; c <= maxCol && !s.IsAlerted; c++ {
@@ -352,8 +451,8 @@ func (e *Engine) updateSurvivorAlertsChunk(chunk SurvivorChunk) {
 					if !z.Active {
 						continue
 					}
-					dx := s.X - z.X
-					dy := s.Y - z.Y
+					dx := e.posSnapshotX[i] - z.X
+					dy := e.posSnapshotY[i] - z.Y
 					if dx*dx+dy*dy <= awarenessSq {
 						s.IsAlerted = true
 						break
@@ -364,7 +463,7 @@ func (e *Engine) updateSurvivorAlertsChunk(chunk SurvivorChunk) {
 
 		// Propagation de la panique par voisins alertés
 		if !s.IsAlerted {
-			minColP, maxColP, minRowP, maxRowP := e.boundingCells(s.X, s.Y, PanicSpreadRadius)
+			minColP, maxColP, minRowP, maxRowP := e.boundingCells(e.posSnapshotX[i], e.posSnapshotY[i], PanicSpreadRadius)
 			for r := minRowP; r <= maxRowP && !s.IsAlerted; r++ {
 				rowOffset := r * GridCols
 				for c := minColP; c <= maxColP && !s.IsAlerted; c++ {
@@ -377,10 +476,10 @@ func (e *Engine) updateSurvivorAlertsChunk(chunk SurvivorChunk) {
 							continue
 						}
 
-						dx := s.X - other.X
-						dy := s.Y - other.Y
+						dx := e.posSnapshotX[i] - e.posSnapshotX[j]
+						dy := e.posSnapshotY[i] - e.posSnapshotY[j]
 						if dx*dx+dy*dy <= panicSpreadSq {
-							if e.rng.Float64() < PanicSpreadChance {
+							if rng.Float64() < PanicSpreadChance {
 								s.IsAlerted = true
 								break
 							}
@@ -406,8 +505,8 @@ func (e *Engine) findNearestSurvivalist(sx, sy float64) (leaderIdx int, bestDist
 			for j := e.grid[rowOffset+c].FirstSurvivor; j != -1; j = e.survivorNext[j] {
 				other := &e.survivors[j]
 				if other.Alive && !other.Escaped && other.IsSurvivalist {
-					sdx := other.X - sx
-					sdy := other.Y - sy
+					sdx := e.posSnapshotX[j] - sx
+					sdy := e.posSnapshotY[j] - sy
 					d2 := sdx*sdx + sdy*sdy
 					if d2 < bestDistSq {
 						bestDistSq = d2
@@ -420,18 +519,11 @@ func (e *Engine) findNearestSurvivalist(sx, sy float64) (leaderIdx int, bestDist
 	return leaderIdx, bestDistSq
 }
 
-// moveSurvivors gère l'évacuation, la fatigue, les trajectoires d'évitement et les déplacements des humains
-// en déléguant le calcul aux sous-tranches indépendantes de survivants attribuées aux workers.
-func (e *Engine) moveSurvivors() {
-	for _, chunk := range e.chunks {
-		e.moveSurvivorsChunk(chunk)
-	}
-}
-
 // moveSurvivorsChunk gère l'évacuation, la fatigue, les trajectoires d'évitement et les déplacements
 // pour une sous-tranche indépendante de survivants.
-func (e *Engine) moveSurvivorsChunk(chunk SurvivorChunk) {
+func (e *Engine) moveSurvivorsChunk(workerID int, chunk SurvivorChunk) {
 	repelSq := SurvivorRepelRadiusSq
+	rng := e.workerRng[workerID]
 
 	for i := chunk.Start; i < chunk.End; i++ {
 		s := &e.survivors[i]
@@ -448,9 +540,9 @@ func (e *Engine) moveSurvivorsChunk(chunk SurvivorChunk) {
 			dy := ex.Y - s.Y
 			if dx*dx+dy*dy <= ExitRadiusSq {
 				s.Escaped = true
-				e.escaped++
+				e.workerEscaped[workerID]++
 				if s.IsSurvivalist {
-					ex.HasSurvivalistIn = true
+					e.workerExitsArmed[workerID][exIdx] = true
 				}
 				break
 			}
@@ -474,7 +566,7 @@ func (e *Engine) moveSurvivorsChunk(chunk SurvivorChunk) {
 			if s.Stamina < MaxStamina {
 				s.Stamina++
 			}
-			s.WanderAng += (e.rng.Float64() - 0.5) * 0.2
+			s.WanderAng += (rng.Float64() - 0.5) * 0.2
 			dx = math.Cos(s.WanderAng) * (s.Speed * 0.4)
 			dy = math.Sin(s.WanderAng) * (s.Speed * 0.4)
 		} else {
@@ -541,20 +633,21 @@ func (e *Engine) moveSurvivorsChunk(chunk SurvivorChunk) {
 			} else {
 				leaderIdx, bestSurvDistSq := e.findNearestSurvivalist(s.X, s.Y)
 				if leaderIdx >= 0 {
-					leader := &e.survivors[leaderIdx]
+					leaderX := e.posSnapshotX[leaderIdx]
+					leaderY := e.posSnapshotY[leaderIdx]
 					bestDist := math.Sqrt(bestSurvDistSq)
-					dx = ((leader.X - s.X) / bestDist) * s.Speed * s.Fear
-					dy = ((leader.Y - s.Y) / bestDist) * s.Speed * s.Fear
+					dx = ((leaderX - s.X) / bestDist) * s.Speed * s.Fear
+					dy = ((leaderY - s.Y) / bestDist) * s.Speed * s.Fear
 				} else {
-					s.WanderAng += (e.rng.Float64() - 0.5) * 0.5
+					s.WanderAng += (rng.Float64() - 0.5) * 0.5
 					dx = math.Cos(s.WanderAng) * s.Speed * 0.8
 					dy = math.Sin(s.WanderAng) * s.Speed * 0.8
 				}
 			}
 		}
 
-		dx += (e.rng.Float64() - 0.5) * 0.8
-		dy += (e.rng.Float64() - 0.5) * 0.8
+		dx += (rng.Float64() - 0.5) * 0.8
+		dy += (rng.Float64() - 0.5) * 0.8
 
 		nextX := s.X + dx
 		nextY := s.Y + dy

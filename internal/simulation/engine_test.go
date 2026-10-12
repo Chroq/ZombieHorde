@@ -1,7 +1,9 @@
 package simulation_test
 
 import (
+	"runtime"
 	"testing"
+	"time"
 
 	"github.com/Chroq/zombie-horde/internal/simulation"
 )
@@ -185,5 +187,45 @@ func TestSurvivorChunkPartitioningScaling(t *testing.T) {
 		if covered != simulation.TotalSurvivors {
 			t.Fatalf("Workers=%d, entités totales couvertes: %d != %d", numWorkers, covered, simulation.TotalSurvivors)
 		}
+	}
+}
+
+// TestWorkerPoolBoundedToNumCPU vérifie que le Worker Pool est strictement borné
+// sur le nombre de cœurs de la machine hôte (runtime.NumCPU()).
+func TestWorkerPoolBoundedToNumCPU(t *testing.T) {
+	eng := simulation.NewEngine(simulation.MasterSeed)
+	defer eng.Close()
+
+	if eng.WorkerCount() != runtime.NumCPU() {
+		t.Fatalf("Taille du Worker Pool attendue (%d cœurs), obtenue: %d", runtime.NumCPU(), eng.WorkerCount())
+	}
+
+	chunks := eng.SurvivorChunks()
+	if len(chunks) != runtime.NumCPU() {
+		t.Fatalf("Nombre de chunks attendu (%d), obtenu: %d", runtime.NumCPU(), len(chunks))
+	}
+}
+
+// TestWorkerPoolEarlyCancellation vérifie que la fermeture du moteur propage
+// l'annulation précoce et stoppe les workers proprement sans deadlock.
+func TestWorkerPoolEarlyCancellation(t *testing.T) {
+	eng := simulation.NewEngine(simulation.MasterSeed)
+
+	// Exécution de quelques ticks
+	for range 3 {
+		eng.Update()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		eng.Close()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Succès : arrêt immédiat
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Deadlock lors de l'arrêt précoce du Worker Pool via context.Cancel")
 	}
 }
