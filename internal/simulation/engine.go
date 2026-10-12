@@ -27,10 +27,13 @@ type Engine struct {
 	survivorNext   [TotalSurvivors]int32
 	zombieNext     [TotalSurvivors]int32
 	wasAlerted     [TotalSurvivors]bool
+	workerCount    int
+	chunks         []SurvivorChunk
 }
 
-// NewEngine instancie et initialise une nouvelle simulation déterministe à partir d'une graine.
-func NewEngine(seed int64) *Engine {
+// NewEngineWithWorkers instancie une nouvelle simulation avec un nombre explicite de workers
+// pour découper équitablement la population de survivants.
+func NewEngineWithWorkers(seed int64, numWorkers int) *Engine {
 	e := &Engine{
 		rng:        rand.New(rand.NewSource(seed)),
 		escaped:    0,
@@ -42,8 +45,14 @@ func NewEngine(seed int64) *Engine {
 	e.initEnvironment()
 	e.initSurvivors()
 	e.initHorde()
+	e.initSurvivorChunks(numWorkers)
 
 	return e
+}
+
+// NewEngine instancie et initialise une nouvelle simulation déterministe à partir d'une graine.
+func NewEngine(seed int64) *Engine {
+	return NewEngineWithWorkers(seed, WorkerCount)
 }
 
 // initEnvironment configure les sas d'évacuation, la pièce centrale et les obstacles procéduraux.
@@ -284,12 +293,50 @@ func (e *Engine) rebuildSpatialGrid() (crowdCenterX, crowdCenterY float64, alive
 	return crowdCenterX, crowdCenterY, aliveCount, aliveInRoomCount
 }
 
-// updateSurvivorAlerts gère la détection des zombies par les survivants et la propagation de la panique.
+// initSurvivorChunks découpe la population totale de survivants en sous-tranches
+// indépendantes et équitablement réparties pour les workers (ex. 8 tranches de 1 250 entités).
+func (e *Engine) initSurvivorChunks(numWorkers int) {
+	if numWorkers <= 0 {
+		numWorkers = 1
+	}
+	e.workerCount = numWorkers
+	e.chunks = make([]SurvivorChunk, numWorkers)
+	total := len(e.survivors)
+	for i := 0; i < numWorkers; i++ {
+		start := i * total / numWorkers
+		end := (i + 1) * total / numWorkers
+		e.chunks[i] = SurvivorChunk{
+			WorkerID: i,
+			Start:    start,
+			End:      end,
+		}
+	}
+}
+
+// SurvivorChunks retourne la liste des sous-tranches indépendantes de survivants.
+func (e *Engine) SurvivorChunks() []SurvivorChunk {
+	return e.chunks
+}
+
+// SurvivorSlice retourne la vue en tranche ([]Survivor) correspondant à un chunk donné.
+func (e *Engine) SurvivorSlice(chunk SurvivorChunk) []Survivor {
+	return e.survivors[chunk.Start:chunk.End]
+}
+
+// updateSurvivorAlerts gère la détection des zombies par les survivants et la propagation de la panique
+// en itérant sur les sous-tranches indépendantes attribuées aux workers.
 func (e *Engine) updateSurvivorAlerts() {
+	for _, chunk := range e.chunks {
+		e.updateSurvivorAlertsChunk(chunk)
+	}
+}
+
+// updateSurvivorAlertsChunk traite la détection et la panique pour une sous-tranche indépendante de survivants.
+func (e *Engine) updateSurvivorAlertsChunk(chunk SurvivorChunk) {
 	awarenessSq := AwarenessRadiusSq
 	panicSpreadSq := PanicSpreadRadiusSq
 
-	for i := range e.survivors {
+	for i := chunk.Start; i < chunk.End; i++ {
 		s := &e.survivors[i]
 		if !s.Alive || s.Escaped || s.IsAlerted {
 			continue
@@ -373,11 +420,20 @@ func (e *Engine) findNearestSurvivalist(sx, sy float64) (leaderIdx int, bestDist
 	return leaderIdx, bestDistSq
 }
 
-// moveSurvivors gère l'évacuation, la fatigue, les trajectoires d'évitement et les déplacements des humains.
+// moveSurvivors gère l'évacuation, la fatigue, les trajectoires d'évitement et les déplacements des humains
+// en déléguant le calcul aux sous-tranches indépendantes de survivants attribuées aux workers.
 func (e *Engine) moveSurvivors() {
+	for _, chunk := range e.chunks {
+		e.moveSurvivorsChunk(chunk)
+	}
+}
+
+// moveSurvivorsChunk gère l'évacuation, la fatigue, les trajectoires d'évitement et les déplacements
+// pour une sous-tranche indépendante de survivants.
+func (e *Engine) moveSurvivorsChunk(chunk SurvivorChunk) {
 	repelSq := SurvivorRepelRadiusSq
 
-	for i := range e.survivors {
+	for i := chunk.Start; i < chunk.End; i++ {
 		s := &e.survivors[i]
 		if !s.Alive || s.Escaped {
 			continue

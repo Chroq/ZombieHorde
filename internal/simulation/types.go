@@ -44,6 +44,19 @@ type Survivor struct {
 	IsExhausted   bool
 }
 
+// SurvivorChunk représente une sous-tranche indépendante de la population de survivants
+// attribuée équitablement à un worker.
+type SurvivorChunk struct {
+	WorkerID int `json:"worker_id"`
+	Start    int `json:"start"`
+	End      int `json:"end"`
+}
+
+// Count retourne le nombre d'entités comprises dans la sous-tranche.
+func (c SurvivorChunk) Count() int {
+	return c.End - c.Start
+}
+
 type Point struct {
 	X             int16 `json:"x"`
 	Y             int16 `json:"y"`
