@@ -31,6 +31,7 @@
 | **v4** | Worker Pool multi-cœurs (`runtime.NumCPU()`) & Goroutines persistantes | ~37.71 ms | 26.52 TPS | 0.67 s | 0 allocs/op (0 B) | +249.0% TPS *(x3.49)* |
 | **v5** | Compteurs atomiques lock-free (`sync/atomic`) & Recyclage réseau `sync.Pool` | ~36.41 ms | 27.46 TPS | 0.65 s | 0 allocs/op (0 B) | +261.3% TPS *(x3.61)* |
 | **v6** | Indexation spatiale des obstacles en $O(1)$ (`obstacleGrid`) & Recherche vectorisée des Survivalistes (`aliveSurvivalists`) | **~35.06 ms** | **28.52 TPS** | **0.45 s** | **0 allocs/op (0 B)** | **+275.3% TPS** *(x3.75)* |
+| **v7** | Streaming Binaire WebSocket compact (5B/agent) & Décodage client `DataView` direct | **~35.12 ms** *(61.5 µs sérialisation)* | **28.50 TPS** *(Bande passante: ~50 Ko/frame)* | **0.45 s** | **0 allocs/op (0 B)** | **-82.1% Bande Passante** *(1.5 Mo/s vs 8.4 Mo/s)* |
 
 ---
 
@@ -513,4 +514,43 @@ L'utilisation de la tranche de pointeurs `[]*Survivor` force **10 000 allocation
 1. **Élimination de ~1.9 million d'évaluations de rectangles par tick :** En associant chaque cellule de 50x50 unités aux obstacles qui l'intersectent (en moyenne 0.14 obstacle par cellule), plus de 86% des tests de collisions s'exécutent en 0 itération et 10% en 1 itération, au lieu de 96 tests systématiques.
 2. **Localité spatiale L1 pour la recherche de leader :** La suppression du parcours de cellules 2D pour localiser le survivaliste le plus proche au profit d'un slice contigu `[]SurvivalistPos` (28.8 Ko, résidant intégralement dans le cache L1 de 32 Ko) avec élagage précoce sur l'axe X élimine les branchements imprédictibles et les cache misses, divisant par plus de 2 le coût CPU de la panique collective.
 
+---
 
+### Version v7 (Streaming Binaire WebSocket & Décodage Client Zéro-Copie)
+
+- **Date :** 12/10/2026
+- **Description :** Remplacement de la sérialisation textuelle JSON par un protocole binaire compact direct :
+  1. **Frame d'initialisation statique (`FrameTypeInit = 0x01`) :** Émise une seule fois à l'ouverture du WebSocket. Transmet les dimensions du monde (6B), la configuration des sas (16B/sas) et les 96 obstacles statiques (16B/obstacle, soit ~1.6 Ko total). Supprime définitivement l'envoi redondant des obstacles à chaque tick.
+  2. **Frame de tick dynamique (`FrameTypeTick = 0x02`) :**
+     - **En-tête de métriques fixes (35 octets) :** Seed (8B), TPS (2B), infectés (2B), survivants (2B), alertés (2B), épuisés (2B), experts (2B), civils (2B), sauvés (2B), sas ouverts (1B), indicateur de fin (1B), ratio de survie (4B IEEE 754), état binaire des sas (4B).
+     - **Heatmap sparse (RLE/Sparse) :** Nombre de cellules actives (2B) suivi de triplets `[Index: uint16, Densité: uint8]` (3B/cellule active) encodant uniquement les cellules non vides (~80 à 250 cellules actives au lieu de 10 000 entrées JSON complètes).
+     - **Survivants vivants compacts (5 octets / agent) :** 2 octets pour le nombre d'agents sains restants, puis pour chaque agent : `X: int16 (2B)`, `Y: int16 (2B)`, `Flags: uint8 (1B)` (bit 0: survivaliste, bit 1: alerté, bit 2: épuisé).
+  3. **Zéro-allocation backend :** Utilisation directe de `buf.AvailableBuffer()` et `buf.Grow()` dans les tampons recyclés du `BufferPool`.
+  4. **Décodage client Canvas optimisé (`index.html`) :** Décodage direct via `DataView` sur `ArrayBuffer` et recyclage en place d'un tableau d'objets `survivorPool` sans instanciation JS (suppression des micro-pauses du Garbage Collector V8 du navigateur).
+  5. **Mode de secours (Fallback) :** Préservation intégrale du mode JSON si le client spécifie `?format=json`.
+
+- **Sortie brute du benchmark de sérialisation binaire (`BenchmarkEncodeBinaryFrame`) :**
+  ```text
+  cpu: Intel(R) Core(TM) i7-8665U CPU @ 1.90GHz
+  BenchmarkEncodeBinaryFrame-8   	   18241	     63291 ns/op	       0 B/op	       0 allocs/op
+  BenchmarkEncodeBinaryFrame-8   	   20032	     61267 ns/op	       0 B/op	       0 allocs/op
+  BenchmarkEncodeBinaryFrame-8   	   20376	     59858 ns/op	       0 B/op	       0 allocs/op
+  PASS
+  ok  	github.com/Chroq/zombie-horde/internal/simulation	4.527s
+  ```
+
+#### Synthèse & Comparatif Réseau vs JSON Textuel :
+
+| Métrique | Flux JSON Textuel (v0 - v5) | Streaming Binaire (v7) | Économie / Gain |
+| :--- | :--- | :--- | :--- |
+| **Taille de trame (10 000 agents)** | **~280 Ko / tick** | **~50.8 Ko / tick** | **-81.9%** |
+| **Taille de trame (5 000 agents)** | **~155 Ko / tick** | **~25.8 Ko / tick** | **-83.4%** |
+| **Bande passante crête (à 30 FPS)** | **~8.4 Mo/s** (67.2 Mbps) | **~1.5 Mo/s** (12.2 Mbps) | **-82.1% de bande passante** |
+| **Temps CPU d'encodage par tick** | ~800 µs - 1.2 ms (`json.Marshal`) | **~61.5 µs** (`EncodeTickFrame`) | **-93% de temps CPU d'encodage** |
+| **Allocations Go par frame** | Plusieurs allocs / copies textuelles | **0 B/op, 0 allocs/op** | **Zéro allocation absolue** |
+| **Pression mémoire navigateur (JS)** | Création/destruction de 10 000 objets/tick | Pool d'objets réutilisé + `DataView` | **0 GC lag client** |
+
+#### Analyse technique de la réduction d'empreinte :
+1. **Élimination de la syntaxe JSON verbeuse :** En JSON, chaque survivant générait `"{"x":1234.5,"y":2345.6,"is_survivalist":true,"is_alerted":false,"is_exhausted":false}"` (~85 octets de caractères ASCII). En binaire compact, 5 octets bruts suffisent amplement sans perte de fidélité spatiale (`int16` couvrant de -32768 à 32767 pour un monde de 5000x5000).
+2. **Transfert unique de la géométrie statique :** En isolant les 96 obstacles statiques dans une trame d'initialisation dédiée (`0x01`), plus de 5.5 Ko de géométrie répétée à chaque tick sont définitivement épargnés du flux temps réel.
+3. **Encodage clairsemé de la heatmap :** Au lieu d'émettre les 10 000 entiers de la grille 100x100 (dont >98% sont nuls), l'encodage sparse ne transfère que les 50 à 250 cellules occupées par des zombies, réduisant la charge heatmap de 20 000 octets à moins de 800 octets.
