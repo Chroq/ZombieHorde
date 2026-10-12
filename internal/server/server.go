@@ -51,7 +51,13 @@ func (s *Server) Start() error {
 
 	// Résolution du répertoire statique (recherche d'index.html)
 	resolvedDir := s.resolveStaticDir()
-	mux.Handle("/", http.FileServer(http.Dir(resolvedDir)))
+	fs := http.FileServer(http.Dir(resolvedDir))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
+		fs.ServeHTTP(w, r)
+	})
 	mux.Handle("/ws", websocket.Handler(s.handleWebSocket))
 
 	fmt.Printf("Moteur d'épidémie ZombieHorde disponible sur http://localhost%s\n", s.addr)
