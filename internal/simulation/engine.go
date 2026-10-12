@@ -33,48 +33,70 @@ func PutPointSlice(slicePtr *[]Point) {
 	PointSlicePool.Put(slicePtr)
 }
 
+type workerTask uint8
+
+const (
+	taskSurvivors workerTask = 1
+	taskZombies   workerTask = 2
+)
+
+type InfectionReq struct {
+	TargetIdx int32
+	TargetID  int64
+	X, Y      float64
+}
+
 // Engine encapsule l'état complet et le moteur de calcul d'une simulation ZombieHorde.
 type Engine struct {
-	rng              *rand.Rand
-	obstacles        []Obstacle
-	horde            []Zombie
-	exits            []ExitZone
-	newZombies       []Zombie
-	survivors        []Survivor
-	heatmap          [GridCols * GridRows]int
-	survPoints       []Point
-	escaped          int64
-	infected         int64
-	metricsMu        sync.Mutex
-	useMutex         bool
-	centerRoomX      float64
-	centerRoomY      float64
-	centerRoomSize   float64
-	doorNorthX       float64
-	doorNorthY       float64
-	doorSouthX       float64
-	doorSouthY       float64
-	grid             [GridCols * GridRows]Cell
-	survivorNext     [TotalSurvivors]int32
-	zombieNext       [TotalSurvivors]int32
-	wasAlerted       [TotalSurvivors]bool
-	posSnapshotX     [TotalSurvivors]float64
-	posSnapshotY     [TotalSurvivors]float64
-	workerCount       int
-	chunks            []SurvivorChunk
-	workerRng         []*rand.Rand
-	workerExitsArmed  [][4]bool
-	workerStartCh     []chan struct{}
-	workerDoneWg      sync.WaitGroup
-	workerCtx         context.Context
-	workerCancel      context.CancelFunc
-	closed            bool
-	obstacleGrid      [GridCols * GridRows][]int16
-	aliveSurvivalists []SurvivalistPos
+	rng                 *rand.Rand
+	obstacles           []Obstacle
+	horde               []Zombie
+	exits               []ExitZone
+	newZombies          []Zombie
+	survivors           []Survivor
+	heatmap             [GridCols * GridRows]int
+	survPoints          []Point
+	escaped             int64
+	infected            int64
+	metricsMu           sync.Mutex
+	useMutex            bool
+	centerRoomX         float64
+	centerRoomY         float64
+	centerRoomSize      float64
+	doorNorthX          float64
+	doorNorthY          float64
+	doorSouthX          float64
+	doorSouthY          float64
+	grid                [GridCols * GridRows]Cell
+	survivorNext        [TotalSurvivors]int32
+	zombieNext          [TotalSurvivors]int32
+	wasAlerted          [TotalSurvivors]bool
+	posSnapshotX        [TotalSurvivors]float64
+	posSnapshotY        [TotalSurvivors]float64
+	workerCount          int
+	chunks               []SurvivorChunk
+	workerHordeChunks    []SurvivorChunk
+	workerRng            []*rand.Rand
+	workerExitsArmed     [][4]bool
+	workerExitsSealed    [][4]bool
+	workerInfectionReqs  [][]InfectionReq
+	workerTaskCh         []chan workerTask
+	workerDoneWg         sync.WaitGroup
+	workerCtx            context.Context
+	workerCancel         context.CancelFunc
+	closed               bool
+	obstacleGrid         [GridCols * GridRows][]int16
+	aliveSurvivalists    []SurvivalistPos
+
+	// Données de frame partagées en lecture pour la phase zombie multi-cœurs
+	frameAliveCount       int
+	frameAliveInRoomCount int
+	frameCrowdCenterX     float64
+	frameCrowdCenterY     float64
 }
 
 // NewEngineWithWorkers instancie une nouvelle simulation avec un pool de workers borné
-// pour découper équitablement la population de survivants.
+// pour découper équitablement la population de survivants et la horde de zombies.
 func NewEngineWithWorkers(seed int64, numWorkers int) *Engine {
 	if numWorkers <= 0 {
 		numWorkers = runtime.NumCPU()
@@ -86,24 +108,28 @@ func NewEngineWithWorkers(seed int64, numWorkers int) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	e := &Engine{
-		rng:               rand.New(rand.NewSource(seed)),
-		escaped:           0,
-		infected:          int64(InitialInfected),
-		obstacles:         make([]Obstacle, 0, 6+ObstacleCount),
-		newZombies:        make([]Zombie, 0, TotalSurvivors),
-		survPoints:        make([]Point, 0, TotalSurvivors),
-		aliveSurvivalists: make([]SurvivalistPos, 0, TotalSurvivors),
-		workerCount:       numWorkers,
-		workerCtx:         ctx,
-		workerCancel:      cancel,
-		workerRng:         make([]*rand.Rand, numWorkers),
-		workerExitsArmed:  make([][4]bool, numWorkers),
-		workerStartCh:     make([]chan struct{}, numWorkers),
+		rng:                 rand.New(rand.NewSource(seed)),
+		escaped:             0,
+		infected:            int64(InitialInfected),
+		obstacles:           make([]Obstacle, 0, 6+ObstacleCount),
+		newZombies:          make([]Zombie, 0, TotalSurvivors),
+		survPoints:          make([]Point, 0, TotalSurvivors),
+		aliveSurvivalists:   make([]SurvivalistPos, 0, TotalSurvivors),
+		workerCount:         numWorkers,
+		workerCtx:           ctx,
+		workerCancel:        cancel,
+		workerRng:           make([]*rand.Rand, numWorkers),
+		workerExitsArmed:    make([][4]bool, numWorkers),
+		workerExitsSealed:   make([][4]bool, numWorkers),
+		workerInfectionReqs: make([][]InfectionReq, numWorkers),
+		workerHordeChunks:   make([]SurvivorChunk, numWorkers),
+		workerTaskCh:        make([]chan workerTask, numWorkers),
 	}
 
 	for i := 0; i < numWorkers; i++ {
 		e.workerRng[i] = rand.New(rand.NewSource(seed + int64(i)*10007 + 1))
-		e.workerStartCh[i] = make(chan struct{}, 1)
+		e.workerTaskCh[i] = make(chan workerTask, 1)
+		e.workerInfectionReqs[i] = make([]InfectionReq, 0, 128)
 	}
 
 	e.initEnvironment()
@@ -187,14 +213,21 @@ func (e *Engine) startWorkerPool() {
 }
 
 func (e *Engine) workerLoop(workerID int) {
-	chunk := e.chunks[workerID]
+	survChunk := e.chunks[workerID]
 	for {
 		select {
 		case <-e.workerCtx.Done():
 			return
-		case <-e.workerStartCh[workerID]:
-			e.updateSurvivorAlertsChunk(workerID, chunk)
-			e.moveSurvivorsChunk(workerID, chunk)
+		case task := <-e.workerTaskCh[workerID]:
+			if task == taskSurvivors {
+				e.updateSurvivorAlertsChunk(workerID, survChunk)
+				e.moveSurvivorsChunk(workerID, survChunk)
+			} else if task == taskZombies {
+				zChunk := e.workerHordeChunks[workerID]
+				if zChunk.Count() > 0 {
+					e.updateZombiesChunk(workerID, zChunk)
+				}
+			}
 			e.workerDoneWg.Done()
 		}
 	}
@@ -411,23 +444,41 @@ func (e *Engine) boundingCells(x, y, radius float64) (minCol, maxCol, minRow, ma
 }
 
 // Update exécute un cycle (tick) de la simulation spatiale en exploitant la grille spatiale 1D
-// et en distribuant les lots de survivants sur le Worker Pool borné synchronisé par sync.WaitGroup.
+// et en distribuant les calculs physiques des survivants et de la horde sur le Worker Pool borné.
 func (e *Engine) Update() {
 	e.newZombies = e.newZombies[:0]
 
 	crowdCenterX, crowdCenterY, aliveCount, aliveInRoomCount := e.rebuildSpatialGrid()
 
-	// Distribution des lots de survivants sur le Worker Pool borné
+	// 1. Distribution des lots de survivants sur le Worker Pool borné
 	e.workerDoneWg.Add(e.workerCount)
 	for i := 0; i < e.workerCount; i++ {
-		e.workerStartCh[i] <- struct{}{}
+		e.workerTaskCh[i] <- taskSurvivors
 	}
 	e.workerDoneWg.Wait()
 
-	// Réduction sans contention des données produites par les workers
+	// Réduction sans contention de l'armement des sas
 	e.reduceWorkerResults()
 
-	e.updateZombies(aliveCount, aliveInRoomCount, crowdCenterX, crowdCenterY)
+	// 2. Traitement des zombies : séquentiel si horde restreinte (t=0), distribué sur le Worker Pool sinon
+	if len(e.horde) <= 64 {
+		e.updateZombiesSequential(aliveCount, aliveInRoomCount, crowdCenterX, crowdCenterY)
+	} else {
+		e.frameAliveCount = aliveCount
+		e.frameAliveInRoomCount = aliveInRoomCount
+		e.frameCrowdCenterX = crowdCenterX
+		e.frameCrowdCenterY = crowdCenterY
+
+		e.partitionHordeChunks()
+
+		e.workerDoneWg.Add(e.workerCount)
+		for i := 0; i < e.workerCount; i++ {
+			e.workerTaskCh[i] <- taskZombies
+		}
+		e.workerDoneWg.Wait()
+
+		e.reduceZombieResults()
+	}
 }
 
 // reduceWorkerResults agrège l'armement des sas sans contention.
@@ -442,6 +493,59 @@ func (e *Engine) reduceWorkerResults() {
 	}
 }
 
+// partitionHordeChunks découpe dynamiquement la horde de zombies active en sous-tranches indépendantes pour les workers.
+func (e *Engine) partitionHordeChunks() {
+	total := len(e.horde)
+	for i := 0; i < e.workerCount; i++ {
+		start := i * total / e.workerCount
+		end := (i + 1) * total / e.workerCount
+		e.workerHordeChunks[i] = SurvivorChunk{
+			WorkerID: i,
+			Start:    start,
+			End:      end,
+		}
+	}
+}
+
+// reduceZombieResults agrège les nouveaux zombies contaminés et le scellement des sas produits par les workers.
+func (e *Engine) reduceZombieResults() {
+	for w := 0; w < e.workerCount; w++ {
+		for exIdx := range e.exits {
+			if e.workerExitsSealed[w][exIdx] {
+				e.exits[exIdx].IsClosed = true
+				e.workerExitsSealed[w][exIdx] = false
+			}
+		}
+	}
+
+	cellW := WorldSize / float64(GridCols)
+	cellH := WorldSize / float64(GridRows)
+
+	for w := 0; w < e.workerCount; w++ {
+		for _, req := range e.workerInfectionReqs[w] {
+			target := &e.survivors[req.TargetIdx]
+			if target.Alive {
+				target.Alive = false
+				e.RecordInfection()
+				e.horde = append(e.horde, Zombie{
+					Active:    true,
+					ID:        req.TargetID,
+					X:         req.X,
+					Y:         req.Y,
+					Speed:     1.9 + e.rng.Float64()*0.7,
+					WanderAng: e.rng.Float64() * 2 * math.Pi,
+				})
+				col := int(req.X / cellW)
+				row := int(req.Y / cellH)
+				if col >= 0 && col < GridCols && row >= 0 && row < GridRows {
+					e.heatmap[row*GridCols+col]++
+				}
+			}
+		}
+		e.workerInfectionReqs[w] = e.workerInfectionReqs[w][:0]
+	}
+}
+
 // rebuildSpatialGrid réinitialise la grille spatiale, insère les survivants et zombies actifs,
 // et calcule le barycentre de la foule ainsi que le nombre de survivants vivants.
 func (e *Engine) rebuildSpatialGrid() (crowdCenterX, crowdCenterY float64, aliveCount, aliveInRoomCount int) {
@@ -449,6 +553,7 @@ func (e *Engine) rebuildSpatialGrid() (crowdCenterX, crowdCenterY float64, alive
 		e.grid[i].FirstSurvivor = -1
 		e.grid[i].FirstZombie = -1
 	}
+	clear(e.heatmap[:])
 
 	e.aliveSurvivalists = e.aliveSurvivalists[:0]
 
@@ -502,7 +607,7 @@ func (e *Engine) rebuildSpatialGrid() (crowdCenterX, crowdCenterY float64, alive
 		crowdCenterY = sumY / float64(aliveCount)
 	}
 
-	// Insertion de la horde dans la grille
+	// Insertion de la horde dans la grille et agrégation heatmap en 1 seule passe
 	for i := range e.horde {
 		z := &e.horde[i]
 		if z.Active {
@@ -519,6 +624,7 @@ func (e *Engine) rebuildSpatialGrid() (crowdCenterX, crowdCenterY float64, alive
 				row = GridRows - 1
 			}
 			cellIdx := row*GridCols + col
+			e.heatmap[cellIdx]++
 			e.zombieNext[i] = e.grid[cellIdx].FirstZombie
 			e.grid[cellIdx].FirstZombie = int32(i)
 		}
@@ -764,7 +870,37 @@ func (e *Engine) moveSurvivorsChunk(workerID int, chunk SurvivorChunk) {
 					dy = ((targetExit.Y - s.Y) / bestDist) * s.Speed * s.Fear
 				}
 			} else {
-				leaderIdx, bestSurvDistSq := e.findNearestSurvivalist(s.X, s.Y)
+				leaderIdx := -1
+				var bestSurvDistSq float64
+
+				// Validation du cache temporel de guide survivaliste
+				if s.LeaderTimer > 0 && s.TargetLeader >= 0 && int(s.TargetLeader) < len(e.survivors) {
+					lead := &e.survivors[s.TargetLeader]
+					if lead.Alive && !lead.Escaped {
+						lx := e.posSnapshotX[s.TargetLeader]
+						ly := e.posSnapshotY[s.TargetLeader]
+						ldx := lx - s.X
+						ldy := ly - s.Y
+						d2 := ldx*ldx + ldy*ldy
+						if d2 <= 1800.0*1800.0 {
+							leaderIdx = int(s.TargetLeader)
+							bestSurvDistSq = d2
+							s.LeaderTimer--
+						}
+					}
+				}
+
+				if leaderIdx < 0 {
+					leaderIdx, bestSurvDistSq = e.findNearestSurvivalist(s.X, s.Y)
+					if leaderIdx >= 0 {
+						s.TargetLeader = int32(leaderIdx)
+						s.LeaderTimer = 12
+					} else {
+						s.TargetLeader = -1
+						s.LeaderTimer = 0
+					}
+				}
+
 				if leaderIdx >= 0 {
 					leaderX := e.posSnapshotX[leaderIdx]
 					leaderY := e.posSnapshotY[leaderIdx]
@@ -828,8 +964,8 @@ func (e *Engine) findClosestSurvivor(zx, zy, visionSq float64, inRoom bool, aliv
 	return closestIdx, closestDistSq
 }
 
-// updateZombies pilote la traque, les infections et les mouvements de la horde de manière déterministe.
-func (e *Engine) updateZombies(aliveCount, aliveInRoomCount int, crowdCenterX, crowdCenterY float64) {
+// updateZombiesSequential traite les zombies de manière séquentielle rapide lorsque la horde est très petite (t=0).
+func (e *Engine) updateZombiesSequential(aliveCount, aliveInRoomCount int, crowdCenterX, crowdCenterY float64) {
 	visionSq := ZombieVisionRadiusSq
 	sealSq := ExitSealZombieRadiusSq
 
@@ -839,11 +975,18 @@ func (e *Engine) updateZombies(aliveCount, aliveInRoomCount int, crowdCenterX, c
 			continue
 		}
 
+		// Élagage 1D immédiat pour le scellement des sas d'évacuation
 		for exIdx := 0; exIdx < len(e.exits); exIdx++ {
 			ex := &e.exits[exIdx]
 			if ex.HasSurvivalistIn && !ex.IsClosed {
 				edx := ex.X - z.X
+				if edx > ExitSealZombieRadius || edx < -ExitSealZombieRadius {
+					continue
+				}
 				edy := ex.Y - z.Y
+				if edy > ExitSealZombieRadius || edy < -ExitSealZombieRadius {
+					continue
+				}
 				if edx*edx+edy*edy <= sealSq {
 					ex.IsClosed = true
 				}
@@ -851,22 +994,18 @@ func (e *Engine) updateZombies(aliveCount, aliveInRoomCount int, crowdCenterX, c
 		}
 
 		inRoom := (z.X >= e.centerRoomX && z.X <= e.centerRoomX+e.centerRoomSize && z.Y >= e.centerRoomY && z.Y <= e.centerRoomY+e.centerRoomSize)
-
 		closestIdx, closestDistSq := e.findClosestSurvivor(z.X, z.Y, visionSq, inRoom, aliveInRoomCount)
 
 		dx, dy := 0.0, 0.0
 
-		// Cas 1 : Cible humaine directe et visible
 		if closestIdx >= 0 {
 			target := &e.survivors[closestIdx]
-
-			// Test direct au carré pour l'infection
 			if closestDistSq <= InfectionRadiusSq {
 				target.Alive = false
 				e.RecordInfection()
 				e.newZombies = append(e.newZombies, Zombie{
 					Active:    true,
-					ID:        int64(len(e.horde) + len(e.newZombies)),
+					ID:        target.ID,
 					X:         target.X,
 					Y:         target.Y,
 					Speed:     1.9 + e.rng.Float64()*0.7,
@@ -874,12 +1013,10 @@ func (e *Engine) updateZombies(aliveCount, aliveInRoomCount int, crowdCenterX, c
 				})
 			}
 
-			// Normalisation vectorielle nécessaire pour orienter la vitesse du zombie
 			closestDist := math.Sqrt(closestDistSq)
 			dx = ((target.X - z.X) / closestDist) * z.Speed
 			dy = ((target.Y - z.Y) / closestDist) * z.Speed
 		} else if inRoom && aliveInRoomCount == 0 {
-			// Cas 2 : Zombie enfermé dans une pièce dépeuplée -> cap direct sur la porte la plus proche
 			targetDoorX := e.doorNorthX
 			targetDoorY := e.doorNorthY
 			if math.Abs(z.Y-e.doorSouthY) < math.Abs(z.Y-e.doorNorthY) {
@@ -890,18 +1027,15 @@ func (e *Engine) updateZombies(aliveCount, aliveInRoomCount int, crowdCenterX, c
 			ddx := targetDoorX - z.X
 			ddy := targetDoorY - z.Y
 			ddistSq := ddx*ddx + ddy*ddy
-			// Test direct de distance au carré (> 2.0^2 = 4.0), racine calculée uniquement pour normaliser
 			if ddistSq > 4.0 {
 				ddist := math.Sqrt(ddistSq)
 				dx = (ddx / ddist) * z.Speed
 				dy = (ddy / ddist) * z.Speed
 			}
 		} else if aliveCount > 0 {
-			// Cas 3 : À l'extérieur ou foule en approche -> cap vers le centre de gravité humain
 			cdx := crowdCenterX - z.X
 			cdy := crowdCenterY - z.Y
 			cdistSq := cdx*cdx + cdy*cdy
-			// Test direct au carré (> 1.0^2 = 1.0), Atan2 se charge de la direction sans racine carrée
 			if cdistSq > 1.0 {
 				angleToCrowd := math.Atan2(cdy, cdx) + (e.rng.Float64()-0.5)*0.6
 				dx = math.Cos(angleToCrowd) * z.Speed * 0.9
@@ -930,27 +1064,118 @@ func (e *Engine) updateZombies(aliveCount, aliveInRoomCount int, crowdCenterX, c
 	}
 
 	if len(e.newZombies) > 0 {
+		cellW := WorldSize / float64(GridCols)
+		cellH := WorldSize / float64(GridRows)
+		for _, nz := range e.newZombies {
+			col := int(nz.X / cellW)
+			row := int(nz.Y / cellH)
+			if col >= 0 && col < GridCols && row >= 0 && row < GridRows {
+				e.heatmap[row*GridCols+col]++
+			}
+		}
 		e.horde = append(e.horde, e.newZombies...)
 	}
 }
 
-// GenerateHeatmap génère la grille de densité de la horde de zombies.
-func (e *Engine) GenerateHeatmap() []int {
-	clear(e.heatmap[:])
-	cellW := WorldSize / float64(GridCols)
-	cellH := WorldSize / float64(GridRows)
+// updateZombiesChunk traite une sous-tranche indépendante de la horde de zombies sur un worker dédié.
+func (e *Engine) updateZombiesChunk(workerID int, chunk SurvivorChunk) {
+	visionSq := ZombieVisionRadiusSq
+	sealSq := ExitSealZombieRadiusSq
+	rng := e.workerRng[workerID]
 
-	for _, z := range e.horde {
+	for i := chunk.Start; i < chunk.End; i++ {
+		z := &e.horde[i]
 		if !z.Active {
 			continue
 		}
-		gx := int(z.X / cellW)
-		gy := int(z.Y / cellH)
 
-		if gx >= 0 && gx < GridCols && gy >= 0 && gy < GridRows {
-			e.heatmap[gy*GridCols+gx]++
+		// Élagage 1D immédiat pour le scellement des sas d'évacuation
+		for exIdx := 0; exIdx < len(e.exits); exIdx++ {
+			ex := &e.exits[exIdx]
+			if ex.HasSurvivalistIn && !ex.IsClosed {
+				edx := ex.X - z.X
+				if edx > ExitSealZombieRadius || edx < -ExitSealZombieRadius {
+					continue
+				}
+				edy := ex.Y - z.Y
+				if edy > ExitSealZombieRadius || edy < -ExitSealZombieRadius {
+					continue
+				}
+				if edx*edx+edy*edy <= sealSq {
+					e.workerExitsSealed[workerID][exIdx] = true
+				}
+			}
+		}
+
+		inRoom := (z.X >= e.centerRoomX && z.X <= e.centerRoomX+e.centerRoomSize && z.Y >= e.centerRoomY && z.Y <= e.centerRoomY+e.centerRoomSize)
+		closestIdx, closestDistSq := e.findClosestSurvivor(z.X, z.Y, visionSq, inRoom, e.frameAliveInRoomCount)
+
+		dx, dy := 0.0, 0.0
+
+		if closestIdx >= 0 {
+			target := &e.survivors[closestIdx]
+			if closestDistSq <= InfectionRadiusSq && target.Alive {
+				e.workerInfectionReqs[workerID] = append(e.workerInfectionReqs[workerID], InfectionReq{
+					TargetIdx: int32(closestIdx),
+					TargetID:  target.ID,
+					X:         target.X,
+					Y:         target.Y,
+				})
+			}
+
+			closestDist := math.Sqrt(closestDistSq)
+			dx = ((target.X - z.X) / closestDist) * z.Speed
+			dy = ((target.Y - z.Y) / closestDist) * z.Speed
+		} else if inRoom && e.frameAliveInRoomCount == 0 {
+			targetDoorX := e.doorNorthX
+			targetDoorY := e.doorNorthY
+			if math.Abs(z.Y-e.doorSouthY) < math.Abs(z.Y-e.doorNorthY) {
+				targetDoorX = e.doorSouthX
+				targetDoorY = e.doorSouthY
+			}
+
+			ddx := targetDoorX - z.X
+			ddy := targetDoorY - z.Y
+			ddistSq := ddx*ddx + ddy*ddy
+			if ddistSq > 4.0 {
+				ddist := math.Sqrt(ddistSq)
+				dx = (ddx / ddist) * z.Speed
+				dy = (ddy / ddist) * z.Speed
+			}
+		} else if e.frameAliveCount > 0 {
+			cdx := e.frameCrowdCenterX - z.X
+			cdy := e.frameCrowdCenterY - z.Y
+			cdistSq := cdx*cdx + cdy*cdy
+			if cdistSq > 1.0 {
+				angleToCrowd := math.Atan2(cdy, cdx) + (rng.Float64()-0.5)*0.6
+				dx = math.Cos(angleToCrowd) * z.Speed * 0.9
+				dy = math.Sin(angleToCrowd) * z.Speed * 0.9
+			}
+		} else {
+			z.WanderAng += (rng.Float64() - 0.5) * 0.4
+			dx = math.Cos(z.WanderAng) * (z.Speed * 0.6)
+			dy = math.Sin(z.WanderAng) * (z.Speed * 0.6)
+		}
+
+		nextX := z.X + dx
+		nextY := z.Y + dy
+
+		if !e.collidesWithObstacleOrClosedExit(nextX, z.Y) {
+			z.X = nextX
+		} else {
+			z.WanderAng += math.Pi * 0.5
+		}
+
+		if !e.collidesWithObstacleOrClosedExit(z.X, nextY) {
+			z.Y = nextY
+		} else {
+			z.WanderAng += math.Pi * 0.5
 		}
 	}
+}
+
+// GenerateHeatmap retourne la grille de densité de la horde de zombies (pré-calculée lors du partitionnement spatial).
+func (e *Engine) GenerateHeatmap() []int {
 	return e.heatmap[:]
 }
 

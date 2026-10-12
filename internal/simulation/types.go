@@ -37,6 +37,8 @@ type Survivor struct {
 	Fear          float64
 	WanderAng     float64
 	Stamina       int16
+	TargetLeader  int32
+	LeaderTimer   uint8
 	Escaped       bool
 	Alive         bool
 	IsSurvivalist bool
