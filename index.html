@@ -292,31 +292,140 @@
       }
 
       const ws = new WebSocket("ws://" + window.location.host + "/ws");
+      ws.binaryType = "arraybuffer";
       ws.onopen = () => dot.classList.add("on");
       ws.onclose = () => dot.classList.remove("on");
 
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          heatmap = data.heatmap || [];
-          survivors = data.survivors || [];
-          obstacles = data.obstacles || [];
-          exits = data.exits || [];
-          gridCols = data.grid_cols;
-          gridRows = data.grid_rows;
-          worldSize = data.world_size;
+      let survivorPool = [];
 
-          elSeed.textContent = data.stats.seed;
-          elTps.textContent = data.tps;
-          elSurvs.textContent = data.stats.survivalists;
-          elNormals.textContent = data.stats.normals;
-          elAlerted.innerHTML = `${data.stats.alerted} <span>en panique</span>`;
-          elInfected.textContent = data.stats.infected;
-          elEscaped.textContent = data.stats.escaped;
-          elRatio.textContent = `${data.stats.survival_ratio}%`;
-          elExits.textContent = `${data.stats.open_exits} / ${exits.length}`;
-        } catch (e) {
-          console.error(e);
+      ws.onmessage = (event) => {
+        if (event.data instanceof ArrayBuffer) {
+          const view = new DataView(event.data);
+          const msgType = view.getUint8(0);
+
+          if (msgType === 1) {
+            // FrameTypeInit (0x01)
+            worldSize = view.getUint16(1, true);
+            gridCols = view.getUint16(3, true);
+            gridRows = view.getUint16(5, true);
+            heatmap = new Uint8Array(gridCols * gridRows);
+
+            const exitCount = view.getUint8(7);
+            exits = [];
+            let offset = 8;
+            for (let i = 0; i < exitCount; i++) {
+              const x = view.getFloat32(offset, true);
+              const y = view.getFloat32(offset + 4, true);
+              const r = view.getFloat32(offset + 8, true);
+              const id = view.getFloat32(offset + 12, true);
+              exits.push({ id, x, y, r, is_closed: false, has_survivalist_in: false });
+              offset += 16;
+            }
+
+            const obsCount = view.getUint16(offset, true);
+            offset += 2;
+            obstacles = [];
+            for (let i = 0; i < obsCount; i++) {
+              const ox = view.getFloat32(offset, true);
+              const oy = view.getFloat32(offset + 4, true);
+              const ow = view.getFloat32(offset + 8, true);
+              const oh = view.getFloat32(offset + 12, true);
+              obstacles.push({ x: ox, y: oy, w: ow, h: oh });
+              offset += 16;
+            }
+          } else if (msgType === 2) {
+            // FrameTypeTick (0x02)
+            const seed = view.getBigInt64(1, true);
+            const tps = view.getUint16(9, true);
+            const infected = view.getUint16(11, true);
+            const healthy = view.getUint16(13, true);
+            const alerted = view.getUint16(15, true);
+            const exhausted = view.getUint16(17, true);
+            const survs = view.getUint16(19, true);
+            const normals = view.getUint16(21, true);
+            const escaped = view.getUint16(23, true);
+            const openExits = view.getUint8(25);
+            const isFinished = view.getUint8(26);
+            const ratio = view.getFloat32(27, true);
+
+            // Statut des sas (offset 31 à 35)
+            for (let i = 0; i < exits.length && i < 4; i++) {
+              const statusByte = view.getUint8(31 + i);
+              exits[i].is_closed = (statusByte & 0x01) !== 0;
+              exits[i].has_survivalist_in = (statusByte & 0x02) !== 0;
+            }
+
+            elSeed.textContent = seed.toString();
+            elTps.textContent = tps;
+            elSurvs.textContent = survs;
+            elNormals.textContent = normals;
+            elAlerted.innerHTML = `${alerted} <span>en panique</span>`;
+            elInfected.textContent = infected;
+            elEscaped.textContent = escaped;
+            elRatio.textContent = `${ratio.toFixed(1)}%`;
+            elExits.textContent = `${openExits} / ${exits.length}`;
+
+            // Heatmap sparse
+            if (!heatmap || heatmap.length !== gridCols * gridRows) {
+              heatmap = new Uint8Array(gridCols * gridRows);
+            } else {
+              heatmap.fill(0);
+            }
+
+            const activeCellCount = view.getUint16(35, true);
+            let offset = 37;
+            for (let i = 0; i < activeCellCount; i++) {
+              const cellIdx = view.getUint16(offset, true);
+              const density = view.getUint8(offset + 2);
+              if (cellIdx < heatmap.length) {
+                heatmap[cellIdx] = density;
+              }
+              offset += 3;
+            }
+
+            // Survivants vivants (5 octets par agent)
+            const survCount = view.getUint16(offset, true);
+            offset += 2;
+
+            while (survivorPool.length < survCount) {
+              survivorPool.push({ x: 0, y: 0, is_survivalist: false, is_alerted: false, is_exhausted: false });
+            }
+            survivors = survivorPool.slice(0, survCount);
+
+            for (let i = 0; i < survCount; i++) {
+              const s = survivors[i];
+              s.x = view.getInt16(offset, true);
+              s.y = view.getInt16(offset + 2, true);
+              const flags = view.getUint8(offset + 4);
+              s.is_survivalist = (flags & 0x01) !== 0;
+              s.is_alerted = (flags & 0x02) !== 0;
+              s.is_exhausted = (flags & 0x04) !== 0;
+              offset += 5;
+            }
+          }
+        } else {
+          try {
+            const data = JSON.parse(event.data);
+            heatmap = data.heatmap || [];
+            survivors = data.survivors || [];
+            obstacles = data.obstacles || [];
+            exits = data.exits || [];
+            gridCols = data.grid_cols;
+            gridRows = data.grid_rows;
+            worldSize = data.world_size;
+
+            elSeed.textContent = data.stats.seed;
+            elTps.textContent = data.tps;
+            elSurvs.textContent = data.stats.survivalists;
+            elNormals.textContent = data.stats.normals;
+            elAlerted.innerHTML = `${data.stats.alerted} <span>en panique</span>`;
+            elInfected.textContent = data.stats.infected;
+            elEscaped.textContent = data.stats.escaped;
+            elRatio.textContent = `${data.stats.survival_ratio}%`;
+            elExits.textContent = `${data.stats.open_exits} / ${exits.length}`;
+          } catch (e) {
+            console.error(e);
+          }
         }
       };
 

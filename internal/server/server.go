@@ -82,6 +82,23 @@ func (s *Server) handleWebSocket(ws *websocket.Conn) {
 	engine := simulation.NewEngine(simulation.MasterSeed)
 	defer engine.Close()
 
+	useBinary := true
+	if ws.Request() != nil && ws.Request().URL.Query().Get("format") == "json" {
+		useBinary = false
+	}
+
+	// Pour le streaming binaire, émettre la frame d'initialisation statique (obstacles, sas, monde)
+	if useBinary {
+		ws.PayloadType = websocket.BinaryFrame
+		initBuf := BufferPool.Get().(*bytes.Buffer)
+		engine.EncodeInitFrame(initBuf)
+		if err := websocket.Message.Send(ws, initBuf.Bytes()); err != nil {
+			BufferPool.Put(initBuf)
+			return
+		}
+		BufferPool.Put(initBuf)
+	}
+
 	ticker := time.NewTicker(time.Second / time.Duration(simulation.TargetFPS))
 	defer ticker.Stop()
 
@@ -110,35 +127,45 @@ func (s *Server) handleWebSocket(ws *websocket.Conn) {
 				lastCheck = time.Now()
 			}
 
-			// Extraction d'une tranche de points de télémétrie recyclée depuis le pool
-			payload, ptSlice := engine.BuildFramePayloadWithPool(currentTPS)
-
-			// Extraction d'un buffer mémoire réseau recyclé depuis BufferPool
 			buf := BufferPool.Get().(*bytes.Buffer)
 			buf.Reset()
 
-			err := json.NewEncoder(buf).Encode(payload)
-			// Recyclage immédiat de la tranche temporaire de points
-			simulation.PutPointSlice(ptSlice)
+			var isFinished bool
 
-			if err != nil {
-				BufferPool.Put(buf)
-				cancel()
-				return
+			if useBinary {
+				// Streaming binaire direct (byte-packing compact, 5 octets par agent)
+				ws.PayloadType = websocket.BinaryFrame
+				isFinished = engine.EncodeTickFrame(buf, currentTPS)
+
+				if err := websocket.Message.Send(ws, buf.Bytes()); err != nil {
+					BufferPool.Put(buf)
+					cancel()
+					return
+				}
+			} else {
+				// Mode de secours JSON textuel
+				payload, ptSlice := engine.BuildFramePayloadWithPool(currentTPS)
+				err := json.NewEncoder(buf).Encode(payload)
+				simulation.PutPointSlice(ptSlice)
+
+				if err != nil {
+					BufferPool.Put(buf)
+					cancel()
+					return
+				}
+
+				if err := websocket.Message.Send(ws, buf.String()); err != nil {
+					BufferPool.Put(buf)
+					cancel()
+					return
+				}
+				isFinished = payload.Stats.IsFinished
 			}
 
-			// Diffusion réseau sans allocation dynamique
-			if err := websocket.Message.Send(ws, buf.String()); err != nil {
-				BufferPool.Put(buf)
-				cancel()
-				return
-			}
-
-			// Recyclage du buffer réseau dans BufferPool
 			BufferPool.Put(buf)
 
 			// Propager l'annulation précoce via context.WithCancel dès la fin de partie
-			if payload.Stats.IsFinished {
+			if isFinished {
 				cancel()
 				return
 			}

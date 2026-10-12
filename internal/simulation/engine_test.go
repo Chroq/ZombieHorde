@@ -1,6 +1,7 @@
 package simulation_test
 
 import (
+	"bytes"
 	"runtime"
 	"testing"
 	"time"
@@ -332,5 +333,48 @@ func BenchmarkObstacleCollisionGrid(b *testing.B) {
 		for _, c := range coords {
 			_ = engine.CollidesWithObstacle(c[0], c[1])
 		}
+	}
+}
+
+// TestBinaryEncoding valide la sérialisation des frames binaires Init et Tick.
+func TestBinaryEncoding(t *testing.T) {
+	engine := simulation.NewEngine(simulation.MasterSeed)
+	defer engine.Close()
+
+	var buf bytes.Buffer
+	engine.EncodeInitFrame(&buf)
+
+	if buf.Len() == 0 || buf.Bytes()[0] != simulation.FrameTypeInit {
+		t.Fatalf("Init frame invalide: len=%d, type=%d", buf.Len(), buf.Bytes()[0])
+	}
+
+	buf.Reset()
+	isFinished := engine.EncodeTickFrame(&buf, 30)
+
+	if isFinished {
+		t.Fatalf("La simulation ne doit pas être terminée au premier tick")
+	}
+
+	if buf.Len() == 0 || buf.Bytes()[0] != simulation.FrameTypeTick {
+		t.Fatalf("Tick frame invalide: len=%d, type=%d", buf.Len(), buf.Bytes()[0])
+	}
+
+	// La frame binaire pour 10 000 agents vivants doit mesurer environ 50 Ko (< 55 Ko)
+	if buf.Len() > 55000 {
+		t.Fatalf("Frame binaire trop volumineuse: %d octets (attendu < 55 Ko)", buf.Len())
+	}
+}
+
+// BenchmarkEncodeBinaryFrame mesure le débit et le coût CPU de sérialisation binaire directe.
+func BenchmarkEncodeBinaryFrame(b *testing.B) {
+	b.ReportAllocs()
+	engine := simulation.NewEngine(simulation.MasterSeed)
+	defer engine.Close()
+
+	buf := bytes.NewBuffer(make([]byte, 0, 64*1024))
+
+	b.ResetTimer()
+	for b.Loop() {
+		engine.EncodeTickFrame(buf, 30)
 	}
 }
