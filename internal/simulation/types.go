@@ -57,6 +57,13 @@ func (c SurvivorChunk) Count() int {
 	return c.End - c.Start
 }
 
+// SurvivalistPos stocke les coordonnées d'un survivaliste pour une recherche de guide vectorisée.
+type SurvivalistPos struct {
+	ID int32
+	X  float64
+	Y  float64
+}
+
 type Point struct {
 	X             int16 `json:"x"`
 	Y             int16 `json:"y"`

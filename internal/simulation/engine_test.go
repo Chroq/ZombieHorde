@@ -292,3 +292,45 @@ func BenchmarkMetricsContentionAtomic(b *testing.B) {
 		}
 	})
 }
+
+// TestObstacleGridCollisions valide la détection de collision sur les parois et dans les obstacles.
+func TestObstacleGridCollisions(t *testing.T) {
+	engine := simulation.NewEngine(simulation.MasterSeed)
+	defer engine.Close()
+
+	// Les limites du monde doivent toujours être détectées comme collision
+	if !engine.CollidesWithObstacle(10, 2500) {
+		t.Fatalf("La limite gauche x=10 aurait dû être en collision")
+	}
+	if !engine.CollidesWithObstacle(2500, 10) {
+		t.Fatalf("La limite haute y=10 aurait dû être en collision")
+	}
+	if !engine.CollidesWithObstacle(simulation.WorldSize-10, 2500) {
+		t.Fatalf("La limite droite x=%f aurait dû être en collision", simulation.WorldSize-10)
+	}
+}
+
+// BenchmarkObstacleCollisionGrid mesure la rapidité du test de collision O(1) via la grille d'obstacles.
+func BenchmarkObstacleCollisionGrid(b *testing.B) {
+	b.ReportAllocs()
+	engine := simulation.NewEngine(simulation.MasterSeed)
+	defer engine.Close()
+
+	coords := [8][2]float64{
+		{2500, 2500},
+		{100, 100},
+		{4900, 4900},
+		{1250, 3750},
+		{3750, 1250},
+		{2050, 2050},
+		{2950, 2950},
+		{500, 4500},
+	}
+
+	b.ResetTimer()
+	for b.Loop() {
+		for _, c := range coords {
+			_ = engine.CollidesWithObstacle(c[0], c[1])
+		}
+	}
+}

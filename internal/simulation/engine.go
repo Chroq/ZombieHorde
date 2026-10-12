@@ -60,15 +60,17 @@ type Engine struct {
 	wasAlerted       [TotalSurvivors]bool
 	posSnapshotX     [TotalSurvivors]float64
 	posSnapshotY     [TotalSurvivors]float64
-	workerCount      int
-	chunks           []SurvivorChunk
-	workerRng        []*rand.Rand
-	workerExitsArmed [][4]bool
-	workerStartCh    []chan struct{}
-	workerDoneWg     sync.WaitGroup
-	workerCtx        context.Context
-	workerCancel     context.CancelFunc
-	closed           bool
+	workerCount       int
+	chunks            []SurvivorChunk
+	workerRng         []*rand.Rand
+	workerExitsArmed  [][4]bool
+	workerStartCh     []chan struct{}
+	workerDoneWg      sync.WaitGroup
+	workerCtx         context.Context
+	workerCancel      context.CancelFunc
+	closed            bool
+	obstacleGrid      [GridCols * GridRows][]int16
+	aliveSurvivalists []SurvivalistPos
 }
 
 // NewEngineWithWorkers instancie une nouvelle simulation avec un pool de workers borné
@@ -84,18 +86,19 @@ func NewEngineWithWorkers(seed int64, numWorkers int) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	e := &Engine{
-		rng:              rand.New(rand.NewSource(seed)),
-		escaped:          0,
-		infected:         int64(InitialInfected),
-		obstacles:        make([]Obstacle, 0, 6+ObstacleCount),
-		newZombies:       make([]Zombie, 0, TotalSurvivors),
-		survPoints:       make([]Point, 0, TotalSurvivors),
-		workerCount:      numWorkers,
-		workerCtx:        ctx,
-		workerCancel:     cancel,
-		workerRng:        make([]*rand.Rand, numWorkers),
-		workerExitsArmed: make([][4]bool, numWorkers),
-		workerStartCh:    make([]chan struct{}, numWorkers),
+		rng:               rand.New(rand.NewSource(seed)),
+		escaped:           0,
+		infected:          int64(InitialInfected),
+		obstacles:         make([]Obstacle, 0, 6+ObstacleCount),
+		newZombies:        make([]Zombie, 0, TotalSurvivors),
+		survPoints:        make([]Point, 0, TotalSurvivors),
+		aliveSurvivalists: make([]SurvivalistPos, 0, TotalSurvivors),
+		workerCount:       numWorkers,
+		workerCtx:         ctx,
+		workerCancel:      cancel,
+		workerRng:         make([]*rand.Rand, numWorkers),
+		workerExitsArmed:  make([][4]bool, numWorkers),
+		workerStartCh:     make([]chan struct{}, numWorkers),
 	}
 
 	for i := 0; i < numWorkers; i++ {
@@ -244,6 +247,43 @@ func (e *Engine) initEnvironment() {
 		}
 		e.obstacles = append(e.obstacles, Obstacle{X: ox, Y: oy, W: w, H: h})
 	}
+
+	e.buildObstacleGrid()
+}
+
+// buildObstacleGrid indexe chaque obstacle dans les cellules correspondantes de la grille spatiale
+// afin d'obtenir une complexité de test de collision en O(1) quasi-stricte sans parcours linéaire.
+func (e *Engine) buildObstacleGrid() {
+	cellW := WorldSize / float64(GridCols)
+	cellH := WorldSize / float64(GridRows)
+
+	for obsIdx, obs := range e.obstacles {
+		minCol := int(obs.X / cellW)
+		maxCol := int((obs.X + obs.W) / cellW)
+		minRow := int(obs.Y / cellH)
+		maxRow := int((obs.Y + obs.H) / cellH)
+
+		if minCol < 0 {
+			minCol = 0
+		}
+		if maxCol >= GridCols {
+			maxCol = GridCols - 1
+		}
+		if minRow < 0 {
+			minRow = 0
+		}
+		if maxRow >= GridRows {
+			maxRow = GridRows - 1
+		}
+
+		for r := minRow; r <= maxRow; r++ {
+			rowOffset := r * GridCols
+			for c := minCol; c <= maxCol; c++ {
+				cellIdx := rowOffset + c
+				e.obstacleGrid[cellIdx] = append(e.obstacleGrid[cellIdx], int16(obsIdx))
+			}
+		}
+	}
 }
 
 // initSurvivors instancie l'ensemble des survivants initiaux et leurs attributs.
@@ -305,16 +345,29 @@ func (e *Engine) initHorde() {
 	}
 }
 
+// collidesWithObstacleOrClosedExit teste la collision avec les limites, les obstacles indexés en O(1) et les sas fermés.
 func (e *Engine) collidesWithObstacleOrClosedExit(x, y float64) bool {
 	if x <= 20 || x >= WorldSize-20 || y <= 20 || y >= WorldSize-20 {
 		return true
 	}
-	for _, obs := range e.obstacles {
-		if x >= obs.X && x <= obs.X+obs.W && y >= obs.Y && y <= obs.Y+obs.H {
-			return true
+
+	cellW := WorldSize / float64(GridCols)
+	cellH := WorldSize / float64(GridRows)
+	col := int(x / cellW)
+	row := int(y / cellH)
+
+	if col >= 0 && col < GridCols && row >= 0 && row < GridRows {
+		cellIdx := row*GridCols + col
+		for _, obsIdx := range e.obstacleGrid[cellIdx] {
+			obs := &e.obstacles[obsIdx]
+			if x >= obs.X && x <= obs.X+obs.W && y >= obs.Y && y <= obs.Y+obs.H {
+				return true
+			}
 		}
 	}
-	for _, ex := range e.exits {
+
+	for exIdx := 0; exIdx < len(e.exits); exIdx++ {
+		ex := &e.exits[exIdx]
 		if ex.IsClosed {
 			dx := ex.X - x
 			dy := ex.Y - y
@@ -324,6 +377,11 @@ func (e *Engine) collidesWithObstacleOrClosedExit(x, y float64) bool {
 		}
 	}
 	return false
+}
+
+// CollidesWithObstacle teste la collision spatiale avec un obstacle ou sas fermé (exporté pour les tests et benchmarks).
+func (e *Engine) CollidesWithObstacle(x, y float64) bool {
+	return e.collidesWithObstacleOrClosedExit(x, y)
 }
 
 // boundingCells retourne la plage de coordonnées [minCol, maxCol, minRow, maxRow]
@@ -392,6 +450,8 @@ func (e *Engine) rebuildSpatialGrid() (crowdCenterX, crowdCenterY float64, alive
 		e.grid[i].FirstZombie = -1
 	}
 
+	e.aliveSurvivalists = e.aliveSurvivalists[:0]
+
 	var sumX, sumY float64
 	cellW := WorldSize / float64(GridCols)
 	cellH := WorldSize / float64(GridRows)
@@ -406,6 +466,13 @@ func (e *Engine) rebuildSpatialGrid() (crowdCenterX, crowdCenterY float64, alive
 			sumX += s.X
 			sumY += s.Y
 			aliveCount++
+			if s.IsSurvivalist {
+				e.aliveSurvivalists = append(e.aliveSurvivalists, SurvivalistPos{
+					ID: int32(i),
+					X:  s.X,
+					Y:  s.Y,
+				})
+			}
 			if s.X >= e.centerRoomX && s.X <= e.centerRoomX+e.centerRoomSize && s.Y >= e.centerRoomY && s.Y <= e.centerRoomY+e.centerRoomSize {
 				aliveInRoomCount++
 			}
@@ -553,29 +620,33 @@ func (e *Engine) updateSurvivorAlertsChunk(workerID int, chunk SurvivorChunk) {
 	}
 }
 
-// findNearestSurvivalist recherche le survivaliste le plus proche dans un rayon donné.
+// findNearestSurvivalist recherche le survivaliste le plus proche à partir du snapshot contigu.
 func (e *Engine) findNearestSurvivalist(sx, sy float64) (leaderIdx int, bestDistSq float64) {
 	const searchRadius = 1800.0
 	const searchRadiusSq = searchRadius * searchRadius
 	bestDistSq = searchRadiusSq
 	leaderIdx = -1
 
-	minColL, maxColL, minRowL, maxRowL := e.boundingCells(sx, sy, searchRadius)
-	for r := minRowL; r <= maxRowL; r++ {
-		rowOffset := r * GridCols
-		for c := minColL; c <= maxColL; c++ {
-			for j := e.grid[rowOffset+c].FirstSurvivor; j != -1; j = e.survivorNext[j] {
-				other := &e.survivors[j]
-				if other.Alive && !other.Escaped && other.IsSurvivalist {
-					sdx := e.posSnapshotX[j] - sx
-					sdy := e.posSnapshotY[j] - sy
-					d2 := sdx*sdx + sdy*sdy
-					if d2 < bestDistSq {
-						bestDistSq = d2
-						leaderIdx = int(j)
-					}
-				}
-			}
+	for idx := range e.aliveSurvivalists {
+		surv := &e.aliveSurvivalists[idx]
+		sdx := surv.X - sx
+		if sdx > searchRadius || sdx < -searchRadius {
+			continue
+		}
+		sdxSq := sdx * sdx
+		if sdxSq >= bestDistSq {
+			continue
+		}
+
+		sdy := surv.Y - sy
+		if sdy > searchRadius || sdy < -searchRadius {
+			continue
+		}
+		sdySq := sdy * sdy
+		d2 := sdxSq + sdySq
+		if d2 < bestDistSq {
+			bestDistSq = d2
+			leaderIdx = int(surv.ID)
 		}
 	}
 	return leaderIdx, bestDistSq
@@ -757,7 +828,7 @@ func (e *Engine) findClosestSurvivor(zx, zy, visionSq float64, inRoom bool, aliv
 	return closestIdx, closestDistSq
 }
 
-// updateZombies pilote la traque, les infections et les mouvements de la horde.
+// updateZombies pilote la traque, les infections et les mouvements de la horde de manière déterministe.
 func (e *Engine) updateZombies(aliveCount, aliveInRoomCount int, crowdCenterX, crowdCenterY float64) {
 	visionSq := ZombieVisionRadiusSq
 	sealSq := ExitSealZombieRadiusSq
