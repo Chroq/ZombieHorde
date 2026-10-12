@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,13 @@ import (
 	"github.com/Chroq/zombie-horde/internal/simulation"
 	"golang.org/x/net/websocket"
 )
+
+// BufferPool recycle les tampons mémoire réseau bytes.Buffer pour éviter les allocations GC répétées.
+var BufferPool = sync.Pool{
+	New: func() any {
+		return bytes.NewBuffer(make([]byte, 0, 256*1024))
+	},
+}
 
 // Server gère le serveur HTTP de télémétrie et le serveur WebSocket.
 type Server struct {
@@ -102,19 +110,32 @@ func (s *Server) handleWebSocket(ws *websocket.Conn) {
 				lastCheck = time.Now()
 			}
 
-			payload := engine.BuildFramePayload(currentTPS)
+			// Extraction d'une tranche de points de télémétrie recyclée depuis le pool
+			payload, ptSlice := engine.BuildFramePayloadWithPool(currentTPS)
 
-			data, err := json.Marshal(payload)
+			// Extraction d'un buffer mémoire réseau recyclé depuis BufferPool
+			buf := BufferPool.Get().(*bytes.Buffer)
+			buf.Reset()
+
+			err := json.NewEncoder(buf).Encode(payload)
+			// Recyclage immédiat de la tranche temporaire de points
+			simulation.PutPointSlice(ptSlice)
+
 			if err != nil {
+				BufferPool.Put(buf)
 				cancel()
 				return
 			}
 
-			// Diffusion réseau
-			if err := websocket.Message.Send(ws, string(data)); err != nil {
+			// Diffusion réseau sans allocation dynamique
+			if err := websocket.Message.Send(ws, buf.String()); err != nil {
+				BufferPool.Put(buf)
 				cancel()
 				return
 			}
+
+			// Recyclage du buffer réseau dans BufferPool
+			BufferPool.Put(buf)
 
 			// Propager l'annulation précoce via context.WithCancel dès la fin de partie
 			if payload.Stats.IsFinished {

@@ -6,7 +6,32 @@ import (
 	"math/rand"
 	"runtime"
 	"sync"
+	"sync/atomic"
 )
+
+// PointSlicePool recycle les tranches temporaires de Point pour la télémétrie afin d'éviter la pression sur le GC.
+var PointSlicePool = sync.Pool{
+	New: func() any {
+		s := make([]Point, 0, TotalSurvivors)
+		return &s
+	},
+}
+
+// GetPointSlice extrait une tranche temporaire de Point réinitialisée.
+func GetPointSlice() *[]Point {
+	slicePtr := PointSlicePool.Get().(*[]Point)
+	*slicePtr = (*slicePtr)[:0]
+	return slicePtr
+}
+
+// PutPointSlice replace la tranche temporaire dans le pool pour recyclage.
+func PutPointSlice(slicePtr *[]Point) {
+	if slicePtr == nil {
+		return
+	}
+	*slicePtr = (*slicePtr)[:0]
+	PointSlicePool.Put(slicePtr)
+}
 
 // Engine encapsule l'état complet et le moteur de calcul d'une simulation ZombieHorde.
 type Engine struct {
@@ -18,7 +43,10 @@ type Engine struct {
 	survivors        []Survivor
 	heatmap          [GridCols * GridRows]int
 	survPoints       []Point
-	escaped          int
+	escaped          int64
+	infected         int64
+	metricsMu        sync.Mutex
+	useMutex         bool
 	centerRoomX      float64
 	centerRoomY      float64
 	centerRoomSize   float64
@@ -35,7 +63,6 @@ type Engine struct {
 	workerCount      int
 	chunks           []SurvivorChunk
 	workerRng        []*rand.Rand
-	workerEscaped    []int
 	workerExitsArmed [][4]bool
 	workerStartCh    []chan struct{}
 	workerDoneWg     sync.WaitGroup
@@ -59,6 +86,7 @@ func NewEngineWithWorkers(seed int64, numWorkers int) *Engine {
 	e := &Engine{
 		rng:              rand.New(rand.NewSource(seed)),
 		escaped:          0,
+		infected:         int64(InitialInfected),
 		obstacles:        make([]Obstacle, 0, 6+ObstacleCount),
 		newZombies:       make([]Zombie, 0, TotalSurvivors),
 		survPoints:       make([]Point, 0, TotalSurvivors),
@@ -66,7 +94,6 @@ func NewEngineWithWorkers(seed int64, numWorkers int) *Engine {
 		workerCtx:        ctx,
 		workerCancel:     cancel,
 		workerRng:        make([]*rand.Rand, numWorkers),
-		workerEscaped:    make([]int, numWorkers),
 		workerExitsArmed: make([][4]bool, numWorkers),
 		workerStartCh:    make([]chan struct{}, numWorkers),
 	}
@@ -98,6 +125,43 @@ func NewEngine(seed int64) *Engine {
 // WorkerCount retourne le nombre de workers alloués au pool.
 func (e *Engine) WorkerCount() int {
 	return e.workerCount
+}
+
+// Escaped retourne le nombre de survivants évacués (lecture atomique lock-free).
+func (e *Engine) Escaped() int64 {
+	return atomic.LoadInt64(&e.escaped)
+}
+
+// Infected retourne le nombre total d'infectés (lecture atomique lock-free).
+func (e *Engine) Infected() int64 {
+	return atomic.LoadInt64(&e.infected)
+}
+
+// SetUseMutex bascule la mise à jour des métriques sur sync.Mutex pour observer la dégradation sous pprof.
+func (e *Engine) SetUseMutex(enabled bool) {
+	e.useMutex = enabled
+}
+
+// RecordEscape enregistre une évasion en mode atomique (défaut) ou mutex (test de contention).
+func (e *Engine) RecordEscape() {
+	if e.useMutex {
+		e.metricsMu.Lock()
+		e.escaped++
+		e.metricsMu.Unlock()
+	} else {
+		atomic.AddInt64(&e.escaped, 1)
+	}
+}
+
+// RecordInfection enregistre une contamination en mode atomique (défaut) ou mutex (test de contention).
+func (e *Engine) RecordInfection() {
+	if e.useMutex {
+		e.metricsMu.Lock()
+		e.infected++
+		e.metricsMu.Unlock()
+	} else {
+		atomic.AddInt64(&e.infected, 1)
+	}
 }
 
 // Close arrête proprement les goroutines persistantes du Worker Pool.
@@ -226,6 +290,7 @@ func (e *Engine) initSurvivors() {
 
 // initHorde initialise les premiers infectés de la simulation.
 func (e *Engine) initHorde() {
+	e.infected = int64(InitialInfected)
 	e.horde = make([]Zombie, InitialInfected, TotalSurvivors)
 	for k := range InitialInfected {
 		e.survivors[k].Alive = false
@@ -307,12 +372,9 @@ func (e *Engine) Update() {
 	e.updateZombies(aliveCount, aliveInRoomCount, crowdCenterX, crowdCenterY)
 }
 
-// reduceWorkerResults agrège les statistiques des workers (rescapés, armement des sas) sans contention.
+// reduceWorkerResults agrège l'armement des sas sans contention.
 func (e *Engine) reduceWorkerResults() {
 	for w := 0; w < e.workerCount; w++ {
-		e.escaped += e.workerEscaped[w]
-		e.workerEscaped[w] = 0
-
 		for exIdx := range e.exits {
 			if e.workerExitsArmed[w][exIdx] {
 				e.exits[exIdx].HasSurvivalistIn = true
@@ -540,7 +602,7 @@ func (e *Engine) moveSurvivorsChunk(workerID int, chunk SurvivorChunk) {
 			dy := ex.Y - s.Y
 			if dx*dx+dy*dy <= ExitRadiusSq {
 				s.Escaped = true
-				e.workerEscaped[workerID]++
+				e.RecordEscape()
 				if s.IsSurvivalist {
 					e.workerExitsArmed[workerID][exIdx] = true
 				}
@@ -730,6 +792,7 @@ func (e *Engine) updateZombies(aliveCount, aliveInRoomCount int, crowdCenterX, c
 			// Test direct au carré pour l'infection
 			if closestDistSq <= InfectionRadiusSq {
 				target.Alive = false
+				e.RecordInfection()
 				e.newZombies = append(e.newZombies, Zombie{
 					Active:    true,
 					ID:        int64(len(e.horde) + len(e.newZombies)),
@@ -854,13 +917,30 @@ func (e *Engine) GetOpenExitsCount() int {
 
 // BuildFramePayload produit le payload JSON complet d'un tick pour la télémétrie.
 func (e *Engine) BuildFramePayload(currentTPS int) FramePayload {
+	payload, _ := e.buildFramePayloadWithSlice(currentTPS, &e.survPoints)
+	return payload
+}
+
+// BuildFramePayloadWithPool assemble le payload de télémétrie en exploitant une tranche de Point
+// recyclée depuis PointSlicePool afin de limiter la pression sur le Garbage Collector.
+func (e *Engine) BuildFramePayloadWithPool(currentTPS int) (FramePayload, *[]Point) {
+	ptSlice := GetPointSlice()
+	return e.buildFramePayloadWithSlice(currentTPS, ptSlice)
+}
+
+// BuildFramePayloadFromPool est un alias pour BuildFramePayloadWithPool.
+func (e *Engine) BuildFramePayloadFromPool(currentTPS int) (FramePayload, *[]Point) {
+	return e.BuildFramePayloadWithPool(currentTPS)
+}
+
+func (e *Engine) buildFramePayloadWithSlice(currentTPS int, targetPoints *[]Point) (FramePayload, *[]Point) {
 	healthy, survCount, normCount, alertedCount, exhaustedCount := e.GetSurvivorCounts()
 	isFinished := (healthy == 0)
 
-	e.survPoints = e.survPoints[:0]
+	*targetPoints = (*targetPoints)[:0]
 	for _, s := range e.survivors {
 		if s.Alive && !s.Escaped {
-			e.survPoints = append(e.survPoints, Point{
+			*targetPoints = append(*targetPoints, Point{
 				X:             int16(s.X),
 				Y:             int16(s.Y),
 				IsSurvivalist: s.IsSurvivalist,
@@ -870,10 +950,16 @@ func (e *Engine) BuildFramePayload(currentTPS int) FramePayload {
 		}
 	}
 
-	processed := e.escaped + (len(e.horde) - InitialInfected)
+	esc := int(atomic.LoadInt64(&e.escaped))
+	inf := int(atomic.LoadInt64(&e.infected))
+	if inf < len(e.horde) {
+		inf = len(e.horde)
+	}
+
+	processed := esc + (inf - InitialInfected)
 	ratio := 0.0
 	if processed > 0 {
-		ratio = (float64(e.escaped) / float64(processed)) * 100.0
+		ratio = (float64(esc) / float64(processed)) * 100.0
 	}
 
 	return FramePayload{
@@ -883,13 +969,13 @@ func (e *Engine) BuildFramePayload(currentTPS int) FramePayload {
 		GridRows:  GridRows,
 		Stats: Stats{
 			Seed:          MasterSeed,
-			Infected:      len(e.horde),
+			Infected:      inf,
 			Healthy:       healthy,
 			Alerted:       alertedCount,
 			Exhausted:     exhaustedCount,
 			Survivalists:  survCount,
 			Normals:       normCount,
-			Escaped:       e.escaped,
+			Escaped:       esc,
 			OpenExits:     e.GetOpenExitsCount(),
 			SurvivalRatio: math.Round(ratio*10) / 10,
 			IsFinished:    isFinished,
@@ -897,8 +983,8 @@ func (e *Engine) BuildFramePayload(currentTPS int) FramePayload {
 		Obstacles: e.obstacles,
 		Exits:     e.exits,
 		Heatmap:   e.GenerateHeatmap(),
-		Survivors: e.survPoints,
-	}
+		Survivors: *targetPoints,
+	}, targetPoints
 }
 
 // Instance globale par défaut pour la compatibilité avec l'API package-level.

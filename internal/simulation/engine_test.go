@@ -229,3 +229,66 @@ func TestWorkerPoolEarlyCancellation(t *testing.T) {
 		t.Fatal("Deadlock lors de l'arrêt précoce du Worker Pool via context.Cancel")
 	}
 }
+
+// TestSyncPoolPointSliceRecycling vérifie que le PointSlicePool recycle correctement les tampons de télémétrie.
+func TestSyncPoolPointSliceRecycling(t *testing.T) {
+	slice1 := simulation.GetPointSlice()
+	if slice1 == nil || len(*slice1) != 0 || cap(*slice1) < simulation.TotalSurvivors {
+		t.Fatalf("Tranche initiale invalide: len=%d, cap=%d", len(*slice1), cap(*slice1))
+	}
+
+	*slice1 = append(*slice1, simulation.Point{X: 10, Y: 20})
+	simulation.PutPointSlice(slice1)
+
+	slice2 := simulation.GetPointSlice()
+	if len(*slice2) != 0 {
+		t.Fatalf("La tranche recyclée doit être réinitialisée (len=0), obtenu: %d", len(*slice2))
+	}
+	simulation.PutPointSlice(slice2)
+}
+
+// BenchmarkBuildFramePayloadWithPool mesure le coût de construction avec recyclage sync.Pool.
+func BenchmarkBuildFramePayloadWithPool(b *testing.B) {
+	b.ReportAllocs()
+	engine := simulation.NewEngine(simulation.MasterSeed)
+	defer engine.Close()
+
+	for b.Loop() {
+		_, slice := engine.BuildFramePayloadWithPool(30)
+		simulation.PutPointSlice(slice)
+	}
+}
+
+// BenchmarkMetricsContentionMutex simule la mise à jour concurrente des compteurs sous sync.Mutex.
+func BenchmarkMetricsContentionMutex(b *testing.B) {
+	b.ReportAllocs()
+	runtime.SetMutexProfileFraction(1)
+	engine := simulation.NewEngine(simulation.MasterSeed)
+	defer engine.Close()
+	engine.SetUseMutex(true)
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			engine.RecordEscape()
+			engine.RecordInfection()
+		}
+	})
+}
+
+// BenchmarkMetricsContentionAtomic simule la mise à jour concurrente des compteurs via sync/atomic (lock-free).
+func BenchmarkMetricsContentionAtomic(b *testing.B) {
+	b.ReportAllocs()
+	runtime.SetMutexProfileFraction(1)
+	engine := simulation.NewEngine(simulation.MasterSeed)
+	defer engine.Close()
+	engine.SetUseMutex(false)
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			engine.RecordEscape()
+			engine.RecordInfection()
+		}
+	})
+}
